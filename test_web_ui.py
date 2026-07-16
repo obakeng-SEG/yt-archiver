@@ -175,7 +175,8 @@ class HandlerTests(unittest.TestCase):
         queue = web_ui.DownloadQueue()
         monitor = web_ui.ChannelMonitor.load()
         webhook = web_ui.WebhookManager()
-        handler_class = web_ui.make_handler(queue, csrf_token, monitor, webhook)
+        telegram_monitor = web_ui.TelegramMonitor(web_ui.TelegramConfig())
+        handler_class = web_ui.make_handler(queue, csrf_token, monitor, webhook, telegram_monitor)
         return handler_class, queue
 
     def test_get_root_returns_200_with_csrf(self):

@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlparse
 import yt_archive
 from monitor import ChannelMonitor, MonitorConfig, Channel
 from webhook import WebhookManager
+from telegram_monitor import TelegramMonitor, TelegramConfig, load_telegram_config, save_telegram_config
 
 LOG = logging.getLogger("web_ui")
 
@@ -704,6 +705,7 @@ PAGE_HTML = r"""<!doctype html>
     .card-accent-queue .card-head h2::before { background: var(--yellow); }
     .card-accent-history .card-head h2::before { background: var(--text-3); }
     .card-accent-normalize .card-head h2::before { background: var(--purple); }
+    .card-accent-telegram .card-head h2::before { background: #0088cc; }
     .badge {
       display: inline-flex; align-items: center; gap: 6px;
       font-size: 10px; font-weight: 800; padding: 3px 8px;
@@ -853,6 +855,11 @@ PAGE_HTML = r"""<!doctype html>
     .norm-file-list::-webkit-scrollbar { width: 6px; }
     .norm-file-list::-webkit-scrollbar-track { background: transparent; }
     .norm-file-list::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 3px; }
+    .telegram-files { max-height: 200px; overflow-y: auto; font-family: var(--mono); font-size: 12px; margin-top: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+    .telegram-files::-webkit-scrollbar { width: 6px; }
+    .telegram-files::-webkit-scrollbar-track { background: transparent; }
+    .telegram-files::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 3px; }
+    .telegram-channels { max-height: 150px; overflow-y: auto; font-family: var(--mono); font-size: 12px; margin-top: 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); }
     .norm-file-item {
       display: flex; align-items: center; gap: 10px; padding: 8px 12px;
       border-bottom: 1px solid var(--border-subtle); color: var(--text-2);
@@ -1335,6 +1342,57 @@ PAGE_HTML = r"""<!doctype html>
           </div>
           <div class="norm-file-list" id="norm-file-list">
             <div class="files-empty">Click Scan to list audio files.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Telegram -->
+      <div class="card card-accent-telegram">
+        <div class="card-head">
+          <h2>Telegram</h2>
+          <span class="badge badge-idle" id="telegram-badge">disconnected</span>
+        </div>
+        <div class="card-body">
+          <div class="row row-3">
+            <div class="field">
+              <label for="tg-channel">Channel</label>
+              <div class="input-with-btn">
+                <input type="text" id="tg-channel" placeholder="@channelname or https://t.me/...">
+                <button type="button" class="btn-browse" onclick="addTelegramChannel()">Add</button>
+              </div>
+            </div>
+            <div class="field">
+              <label>&nbsp;</label>
+              <div class="btn-row">
+                <button type="button" class="btn btn-primary" onclick="connectTelegram()">Connect</button>
+                <button type="button" class="btn btn-stop" onclick="disconnectTelegram()">Disconnect</button>
+              </div>
+            </div>
+            <div class="field">
+              <label>&nbsp;</label>
+            </div>
+          </div>
+          <div class="telegram-channels" id="telegram-channels">
+            <div class="channels-empty">No Telegram channels added.</div>
+          </div>
+          <div class="row row-3" style="margin-top: 12px;">
+            <div class="field">
+              <label for="tg-browse-channel">Browse Channel</label>
+              <select id="tg-browse-channel">
+                <option value="">Select channel...</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>&nbsp;</label>
+              <button type="button" class="btn btn-primary" onclick="browseTelegramAudio()">Browse Audio</button>
+            </div>
+            <div class="field">
+              <label>&nbsp;</label>
+              <button type="button" class="btn btn-primary" onclick="downloadSelectedTelegram()">Download Selected</button>
+            </div>
+          </div>
+          <div class="telegram-files" id="telegram-files">
+            <div class="files-empty">Select a channel to browse audio files.</div>
           </div>
         </div>
       </div>
@@ -2410,6 +2468,167 @@ PAGE_HTML = r"""<!doctype html>
         }
       }).catch(() => {});
     }, 2000);
+
+    // Telegram functions
+    let tgFiles = [];
+
+    async function connectTelegram() {
+      try {
+        const res = await fetch('/telegram/connect', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body: 'csrf_token=' + encodeURIComponent(CSRF)
+        });
+        const data = await res.json();
+        if (data.ok) {
+          toast('Connected to Telegram', 'ok');
+          $('telegram-badge').className = 'badge badge-ok';
+          $('telegram-badge').textContent = 'connected';
+          refreshTelegramChannels();
+        } else {
+          toast(data.error || 'Failed to connect', 'err');
+        }
+      } catch(e) { toast('Failed to connect', 'err'); }
+    }
+
+    async function disconnectTelegram() {
+      try {
+        const res = await fetch('/telegram/disconnect', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body: 'csrf_token=' + encodeURIComponent(CSRF)
+        });
+        const data = await res.json();
+        if (data.ok) {
+          toast('Disconnected from Telegram', 'ok');
+          $('telegram-badge').className = 'badge badge-idle';
+          $('telegram-badge').textContent = 'disconnected';
+        }
+      } catch(e) {}
+    }
+
+    async function addTelegramChannel() {
+      const channel = $('tg-channel').value.trim();
+      if (!channel) { toast('Enter a channel name or URL', 'err'); return; }
+      try {
+        const res = await fetch('/telegram/add', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body: 'csrf_token=' + encodeURIComponent(CSRF) + '&channel=' + encodeURIComponent(channel)
+        });
+        const data = await res.json();
+        if (data.ok) {
+          toast('Channel added', 'ok');
+          $('tg-channel').value = '';
+          refreshTelegramChannels();
+        } else {
+          toast(data.error || 'Failed to add channel', 'err');
+        }
+      } catch(e) { toast('Failed to add channel', 'err'); }
+    }
+
+    async function refreshTelegramChannels() {
+      try {
+        const res = await fetch('/telegram/channels', { cache: 'no-store' });
+        const data = await res.json();
+        const list = $('telegram-channels');
+        const select = $('tg-browse-channel');
+        if (!data.channels || data.channels.length === 0) {
+          list.innerHTML = '<div class="channels-empty">No Telegram channels added.</div>';
+          select.innerHTML = '<option value="">Select channel...</option>';
+          return;
+        }
+        list.innerHTML = data.channels.map(ch =>
+          '<div class="channel-item">' +
+          '<span class="channel-name">' + esc(ch.name) + '</span>' +
+          '<span class="channel-username">@' + esc(ch.username || '') + '</span>' +
+          '<button class="btn-remove" onclick="removeTelegramChannel(' + ch.channel_id + ')">Remove</button>' +
+          '</div>'
+        ).join('');
+        select.innerHTML = '<option value="">Select channel...</option>' +
+          data.channels.map(ch =>
+            '<option value="' + ch.channel_id + '">' + esc(ch.name) + '</option>'
+          ).join('');
+      } catch(e) {}
+    }
+
+    async function removeTelegramChannel(channelId) {
+      try {
+        const res = await fetch('/telegram/remove', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body: 'csrf_token=' + encodeURIComponent(CSRF) + '&channel_id=' + channelId
+        });
+        const data = await res.json();
+        if (data.ok) {
+          toast('Channel removed', 'ok');
+          refreshTelegramChannels();
+        }
+      } catch(e) {}
+    }
+
+    async function browseTelegramAudio() {
+      const channelId = $('tg-browse-channel').value;
+      if (!channelId) { toast('Select a channel', 'err'); return; }
+      try {
+        const res = await fetch('/telegram/browse?channel=' + channelId, { cache: 'no-store' });
+        const data = await res.json();
+        const list = $('telegram-files');
+        if (!data.files || data.files.length === 0) {
+          list.innerHTML = '<div class="files-empty">No audio files found.</div>';
+          tgFiles = [];
+          return;
+        }
+        tgFiles = data.files;
+        list.innerHTML = data.files.map((f, i) =>
+          '<label class="norm-file-item">' +
+          '<input type="checkbox" checked data-index="' + i + '">' +
+          '<span class="file-name" title="' + esc(f.filename) + '">' + esc(f.filename) + '</span>' +
+          '<span class="file-size">' + formatSize(f.size) + '</span>' +
+          '</label>'
+        ).join('');
+      } catch(e) { toast('Failed to browse audio', 'err'); }
+    }
+
+    async function downloadSelectedTelegram() {
+      const channelId = $('tg-browse-channel').value;
+      if (!channelId) { toast('Select a channel', 'err'); return; }
+      const checkboxes = $('telegram-files').querySelectorAll('input[type="checkbox"]:checked');
+      const selected = Array.from(checkboxes).map(cb => {
+        const idx = parseInt(cb.dataset.index);
+        return tgFiles[idx]?.message_id;
+      }).filter(Boolean);
+      if (selected.length === 0) { toast('Select files to download', 'err'); return; }
+      try {
+        const body = 'csrf_token=' + encodeURIComponent(CSRF) +
+          '&channel=' + encodeURIComponent(channelId) +
+          '&message_ids=' + encodeURIComponent(selected.join(','));
+        const res = await fetch('/telegram/download', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body: body
+        });
+        const data = await res.json();
+        if (data.ok) {
+          toast('Download started: ' + (data.downloaded || 0) + ' files', 'ok');
+        } else {
+          toast(data.error || 'Failed to download', 'err');
+        }
+      } catch(e) { toast('Failed to download', 'err'); }
+    }
+
+    // Check Telegram status on load
+    fetch('/telegram/status', { cache: 'no-store' }).then(r => r.json()).then(data => {
+      const badge = $('telegram-badge');
+      if (data.connected) {
+        badge.className = 'badge badge-ok';
+        badge.textContent = 'connected';
+        refreshTelegramChannels();
+      } else {
+        badge.className = 'badge badge-idle';
+        badge.textContent = 'disconnected';
+      }
+    }).catch(() => {});
   </script>
 </body>
 </html>
@@ -2429,7 +2648,7 @@ def redirect(location: str) -> bytes:
     return f"Redirecting to {html.escape(location)}".encode("utf-8")
 
 
-def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor, webhook: WebhookManager):
+def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor, webhook: WebhookManager, telegram_monitor: TelegramMonitor):
     class ArchiveRequestHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             if self.path == "/" or self.path.startswith("/?"):
@@ -2538,6 +2757,34 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
                     "running": _normalize_worker.running,
                     "progress": _normalize_worker.progress,
                 })
+                return
+
+            if self.path == "/telegram/status":
+                connected = telegram_monitor._client is not None and telegram_monitor._client.is_connected()
+                self.respond_json({"connected": connected})
+                return
+
+            if self.path == "/telegram/channels":
+                self.respond_json({"channels": telegram_monitor.get_channels()})
+                return
+
+            if self.path.startswith("/telegram/browse"):
+                parsed = urlparse(self.path)
+                qs = parse_qs(parsed.query)
+                channel = first_value(qs, "channel", "")
+                if not channel:
+                    self.respond_json({"files": []})
+                    return
+                try:
+                    import asyncio
+                    loop = asyncio.new_event_loop()
+                    files = loop.run_until_complete(
+                        telegram_monitor.browse_channel_audio(int(channel))
+                    )
+                    loop.close()
+                    self.respond_json({"files": files})
+                except Exception as e:
+                    self.respond_json({"error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
                 return
 
             if self.path == "/favicon.ico":
@@ -2787,6 +3034,91 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
                 self.respond_json({"ok": True})
                 return
 
+            if self.path == "/telegram/connect":
+                try:
+                    import asyncio
+                    loop = asyncio.new_event_loop()
+                    result = loop.run_until_complete(telegram_monitor.connect())
+                    loop.close()
+                    if result:
+                        self.respond_json({"ok": True})
+                    else:
+                        self.respond_json({"error": "Failed to connect"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                except Exception as e:
+                    self.respond_json({"error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
+            if self.path == "/telegram/disconnect":
+                try:
+                    import asyncio
+                    loop = asyncio.new_event_loop()
+                    loop.run_until_complete(telegram_monitor.disconnect())
+                    loop.close()
+                    self.respond_json({"ok": True})
+                except Exception as e:
+                    self.respond_json({"error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
+            if self.path == "/telegram/add":
+                channel = first_value(form, "channel", "").strip()
+                if not channel:
+                    self.respond_json({"error": "Channel is required"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                try:
+                    import asyncio
+                    loop = asyncio.new_event_loop()
+                    # Get channel info
+                    if telegram_monitor._client:
+                        entity = loop.run_until_complete(telegram_monitor._client.get_entity(channel))
+                        ch = telegram_monitor.add_channel(
+                            channel_id=entity.id,
+                            name=getattr(entity, "title", channel),
+                            username=getattr(entity, "username", ""),
+                        )
+                        self.respond_json({"ok": True, "channel": {"id": ch.channel_id, "name": ch.name}})
+                    else:
+                        self.respond_json({"error": "Not connected to Telegram"}, status=HTTPStatus.BAD_REQUEST)
+                    loop.close()
+                except Exception as e:
+                    self.respond_json({"error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
+            if self.path == "/telegram/remove":
+                channel_id_str = first_value(form, "channel_id", "0")
+                try:
+                    channel_id = int(channel_id_str)
+                except ValueError:
+                    self.respond_json({"error": "Invalid channel ID"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                if telegram_monitor.remove_channel(channel_id):
+                    self.respond_json({"ok": True})
+                else:
+                    self.respond_json({"error": "Channel not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+
+            if self.path == "/telegram/download":
+                channel = first_value(form, "channel", "")
+                message_ids_str = first_value(form, "message_ids", "")
+                if not channel or not message_ids_str:
+                    self.respond_json({"error": "Channel and message IDs required"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                try:
+                    message_ids = [int(mid) for mid in message_ids_str.split(",") if mid.strip()]
+                except ValueError:
+                    self.respond_json({"error": "Invalid message IDs"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                try:
+                    import asyncio
+                    loop = asyncio.new_event_loop()
+                    downloaded = loop.run_until_complete(
+                        telegram_monitor.download_audio(int(channel), message_ids)
+                    )
+                    loop.close()
+                    self.respond_json({"ok": True, "downloaded": len(downloaded), "files": downloaded})
+                except Exception as e:
+                    self.respond_json({"error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
             if self.path != "/start":
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
@@ -2900,7 +3232,12 @@ def main(argv: list[str] | None = None) -> int:
     monitor = ChannelMonitor.load(on_new_video=on_new_video, on_new_playlist=on_new_playlist)
     monitor.set_log_callback(lambda msg: LOG.info(f"[monitor] {msg}"))
 
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(queue, secrets.token_urlsafe(32), monitor, webhook))
+    # Initialize Telegram monitor
+    tg_config = load_telegram_config()
+    telegram_monitor = TelegramMonitor(tg_config)
+    telegram_monitor.load_channels()
+
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(queue, secrets.token_urlsafe(32), monitor, webhook, telegram_monitor))
     print(f"Open http://{args.host}:{args.port}")
     print(f"Channel monitor: {'running' if monitor.is_running else 'stopped'}")
     try:
