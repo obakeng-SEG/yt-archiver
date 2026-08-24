@@ -13,6 +13,7 @@ Download and organize audio from YouTube videos, playlists, and channels, plus m
 - **Channel Monitoring**: Automatically check for new uploads
 - **Download Queue**: Manage multiple downloads with priority
 - **Webhook Support**: Get notifications on Discord, Slack, etc.
+- **Media Library**: Automatically organizes every new audio file into `Artist/Album/NN - Song`
 
 ## Requirements
 
@@ -125,6 +126,37 @@ Open the web UI, scroll to the **Telegram** card, connect, then enter a channel 
 2. Click **Browse Audio**, select files
 3. Click **Download Selected**
 
+## Media Library
+
+Every new audio file (YouTube download, Telegram download, or anything you drop
+into `archive/`) is automatically inspected and organized:
+
+```
+library/
+  Artist Name/
+    Album or Playlist/
+      01 - Song.mp3
+      02 - Other Song.mp3
+  @telegram_channel/
+    Telegram/
+      Song From Telegram.mp3
+```
+
+- Metadata priority: **file tags** (via `mutagen`) → yt-dlp sidecar `.info.json`
+  (uploader, playlist, upload date) → folder/filename heuristics
+- Duplicates are collapsed two ways: byte-identical files are detected by
+  content hash, and re-encodes of the same song (same artist/album/title) keep
+  only the **largest/highest-quality copy** — smaller ones are dropped
+  automatically. If the winning source is later deleted, the best remaining
+  copy is promoted back so the song never disappears
+- Same title + different content is disambiguated with the video ID suffix
+- The Library card in the web UI: searchable Artist → Album → Track tree with
+  inline audio preview (click any track), plus "Rescan Library" for a full
+  re-index
+- Downloads report exact progress (%, speed, ETA) via yt-dlp machine templates
+- Runs automatically in the background; also standalone:
+  `python3 media_library.py [source_dir]`
+
 ## Audio Normalization
 
 ### During Download
@@ -205,6 +237,7 @@ HOST=127.0.0.1
 | `channels.json` | Monitored YouTube channels |
 | `download_history.json` | Download history |
 | `queue_state.json` | Queue settings (quiet hours) |
+| `library_index.json` | Media library index (source → organized track) |
 | `webhooks.json` | Webhook configurations |
 
 ## CLI Options

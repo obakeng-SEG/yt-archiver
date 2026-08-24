@@ -243,5 +243,39 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(command[loudnorm_idx + 1], "-af loudnorm=I=-16.0:TP=-1.5:LRA=11")
 
 
+class MachineProgressTests(unittest.TestCase):
+    def make_args(self, **overrides):
+        values = {
+            "urls": ["https://www.youtube.com/watch?v=abc123"],
+            "output_dir": "archive",
+            "audio_format": "mp3",
+            "audio_bitrate": None,
+            "audio_quality": "0",
+            "download_archive": "downloaded.txt",
+            "limit": None,
+            "playlist_items": None,
+            "no_sidecar_metadata": False,
+            "dry_run": False,
+            "yt_dlp": "yt-dlp",
+            "normalize": "off",
+            "normalize_target": -16.0,
+            "machine_progress": True,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_machine_progress_adds_template(self):
+        command = yt_archive.build_ytdlp_command(self.make_args())
+        idx = command.index("--progress-template")
+        self.assertTrue(command[idx + 1].startswith("download:PROGRESS|"))
+        self.assertIn("--newline", command)
+
+    def test_no_machine_progress_for_cli_default(self):
+        args = self.make_args()
+        delattr(args, "machine_progress")  # CLI parser omits it unless flagged
+        command = yt_archive.build_ytdlp_command(args)
+        self.assertNotIn("--progress-template", command)
+
+
 if __name__ == "__main__":
     unittest.main()

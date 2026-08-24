@@ -117,6 +117,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the yt-dlp executable. Default: yt-dlp",
     )
     parser.add_argument(
+        "--machine-progress",
+        dest="machine_progress",
+        action="store_true",
+        help="Emit machine-readable PROGRESS| lines (used by the web UI) instead of "
+             "human progress bars. Off by default for CLI use.",
+    )
+    parser.add_argument(
         "--normalize",
         choices=["off", "ebu", "peak", "rms"],
         default="off",
@@ -168,6 +175,15 @@ def build_ytdlp_command(args: argparse.Namespace) -> list[str]:
         "--output",
         str(output_dir / DEFAULT_OUTPUT_TEMPLATE),
     ]
+
+    if getattr(args, "machine_progress", False):
+        # One line per tick: "PROGRESS|<pct>|<speed>|<eta>|<id>". The web UI
+        # parses these server-side and keeps them out of the visible log.
+        command.extend([
+            "--newline",
+            "--progress-template",
+            "download:PROGRESS|%(progress.percent)f|%(progress.speed)s|%(progress.eta)s|%(id)s",
+        ])
 
     if args.audio_bitrate is not None:
         command.extend(["--postprocessor-args", f"-ab {args.audio_bitrate}"])

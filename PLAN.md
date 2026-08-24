@@ -33,6 +33,16 @@ Every phase ends with the full test suite green. **Status: Phases 1–4 complete
 - `DownloadQueue.__init__` ordering bug: quiet-hour defaults were applied *after* `_load_state()`, silently discarding persisted settings (caught by the new persistence test).
 - Latent path doubling: rescan passed `archive/downloaded.txt` alongside `output_dir=archive`, producing `archive/archive/downloaded.txt` for yt-dlp while scan/clean read `./archive/downloaded.txt`. Now normalized before enqueue.
 
+## Phase 5 — Automated media library (user-requested) ✅
+- [x] **`media_library.py`** — `MediaLibrary` class: background watcher thread polls sources (default `archive/`) every 20 s and reacts instantly to `notify_changes()` triggers.
+- [x] **Per-file review** — metadata priority: mutagen tags (optional dep, in requirements) → yt-dlp sidecar `.info.json` (uploader/playlist/upload_date) → folder + `NNN - Title [id]` filename heuristics. Zero-byte/unreadable files are rejected and reported.
+- [x] **Auto-organization** — copies (non-destructive) into `library/Artist/Album/NN - Song.ext`; Telegram layout maps `@channel → artist`; unsafe chars sanitized; same-title collisions suffixed with video ID; content-hash dedupe keeps a single copy.
+- [x] **Triggers** — after every successful yt-dlp job (`_run_job`), after every Telegram batch download, on manual drops via the poller, plus "Rescan Library" button (full re-index) in the web UI.
+- [x] **Web UI** — new Library card: collapsible Artist → Album → Track tree with counts/scanning badge; `GET /api/library`, `POST /api/library/rescan`.
+- [x] **Standalone mode** — `python3 media_library.py [source ...] --library-dir DIR`.
+- [x] **Tests** — 10 new cases (extraction fallbacks/sidecar overrides, organize layout, incremental skip, dedupe, collision suffixing, sanitization, live watcher pickup, prune-on-delete). Suite total: **74 passing**.
+- [x] Verified end-to-end against the running server: dropped file appeared in `/api/library` and on disk under `library/…` within one scan.
+
 ## Verification
 ```
 $ python3 -m compileall -q *.py && python3 -m unittest discover -s . -p "test_*.py"
@@ -40,6 +50,24 @@ Ran 64 tests ... OK
 ```
 Live smoke test (port 8799): `/` → 200, `/status` → 200, forged `Host:` → 403 `{"error": "Invalid Host header"}`.
 Known trade-off: `/api/normalize/list?dir=` outside home now clamps to `$HOME`, so scanning a huge home root can be slow on first Scan — same cost profile as the pre-existing unrestricted behavior on big trees; acceptable for local use.
+
+## Phase 6 — UI completion pass (user-requested) ✅
+- [x] **Library search** — live filter box; matching tracks shown as flat rows with Artist / Album sub-labels (client-side, capped at 300 hits).
+- [x] **Inline audio preview** — per-track play buttons drive a persistent player bar; `GET /audio?src=…` streams bytes with full HTTP **Range** support (seeking works), served only for paths present in the library index (exact allowlist — no traversal surface). Playing row highlights red with pause glyph.
+- [x] **Large-library scaling** — polls compare a stats signature and skip DOM rebuilds when unchanged (preserves open sections/scroll/playback); tree paginates at 30 artists with "Show more" (+50); re-renders restore open `<details>` state.
+- [x] **Machine-readable progress (M10)** — `yt_archive` gains `--machine-progress` flag (web paths enable it): yt-dlp emits `PROGRESS|pct|speed|eta|id`, parsed server-side in `ArchiveJob` and kept out of the visible log; UI shows exact %, speed and ETA. Legacy regex parsing retained as fallback.
+- [x] **Retry hardening** — `/queue/retry` merges stored history args over current factory defaults, so old history entries missing newer fields can never crash enqueue again.
+- [x] **Cosmetics** — Storage widget reads `0 B` instead of `0 KB` when empty; `--port` strictly clamped to 1–65535.
+- [x] Decision recorded: archive filenames keep the `000 - ` singles prefix (changing the output template would churn existing libraries); the library layer already presents clean names.
+- [x] **Tests** — 8 new (progress template on/off, audio 200/206/404 incl. allowlist rejection, retry hardening, port clamp). Suite total: **82 passing**.
+
+## Phase 7 — Quality-preference dedupe (user-requested) ✅
+- [x] **Identity grouping** — tracks sharing casefolded artist+album+title are treated as one song; multiple encodes/rips collapse into a single library copy.
+- [x] **Larger/higher-quality wins** — when a bigger copy arrives, the old library file is removed and replaced (logged as an upgrade); smaller latecomers are dropped as duplicates. Order-independent.
+- [x] **Byte-identical fast path retained** — content-hash twins stay collapsed even under different labels; flagged `content_dup_of` so the consistency sweep can't resurrect them.
+- [x] **Promotion safety net** — if the winning source is later deleted from the archive, the best surviving copy is re-promoted into the library (orphaned library files with no remaining owner are reclaimed cleanly). Songs never silently disappear.
+- [x] Snapshot/tree lists only held copies; superseded and duplicate entries are hidden.
+- [x] **Tests** — order-independence (both arrival orders), upgrade-on-larger-arrival, delete-winner-promotes-runner-up, collision-suffix safety net via direct `_place`, updated byte-twin expectations. Suite total: **84 passing**.
 
 ## Deferred (documented, not scheduled)
 - **C4** Telegram downloads as background jobs with progress polling (needs job-runner refactor).

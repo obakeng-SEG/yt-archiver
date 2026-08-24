@@ -10,6 +10,7 @@ import html
 import json
 import logging
 import os
+import re
 import secrets
 import shlex
 import subprocess
@@ -22,6 +23,7 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 import yt_archive
+from media_library import MediaLibrary
 from monitor import ChannelMonitor, MonitorConfig, Channel
 from webhook import WebhookManager
 from telegram_monitor import TelegramMonitor, TelegramConfig, load_telegram_config, save_telegram_config
@@ -42,6 +44,15 @@ MAX_LOG_LINES = 500
 MAX_URLS = 50
 MAX_BODY_SIZE = 1024 * 100
 DEFAULT_PORT = 8765
+AUDIO_MIME = {
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".opus": "audio/ogg",
+    ".ogg": "audio/ogg",
+    ".vorbis": "audio/ogg",
+    ".flac": "audio/flac",
+    ".wav": "audio/wav",
+}
 
 
 class ArchiveJob:
@@ -59,6 +70,33 @@ class ArchiveJob:
         self._log_lines: list[str] = []
         self._lock = threading.Lock()
         self._process: subprocess.Popen[str] | None = None
+        self.progress: dict[str, object] = {}
+
+    @property
+    def running(self) -> bool:
+        return self.finished_at is None
+
+    def set_progress(self, payload: str) -> None:
+        """Parse a machine-readable PROGRESS|pct|speed|eta|id tick."""
+        parts = payload.split("|")
+        try:
+            data: dict[str, object] = {"pct": float(parts[1])}
+            speed = parts[2] if len(parts) > 2 else ""
+            eta = parts[3] if len(parts) > 3 else ""
+            vid = parts[4] if len(parts) > 4 else ""
+            try:
+                data["speed"] = float(speed) if speed not in ("", "None", "NA") else None
+            except ValueError:
+                data["speed"] = None
+            try:
+                data["eta"] = int(float(eta)) if eta not in ("", "None", "NA") else None
+            except ValueError:
+                data["eta"] = None
+            data["id"] = vid
+            with self._lock:
+                self.progress = data
+        except (IndexError, ValueError):
+            pass
 
     @property
     def running(self) -> bool:
@@ -85,6 +123,7 @@ class ArchiveJob:
             "url": self.url,
             "name": self.name,
             "log": "\n".join(log_lines),
+            "progress": dict(self.progress) if self.progress else None,
         }
 
 
@@ -366,6 +405,11 @@ class DownloadQueue:
 
             assert process.stdout is not None
             for line in process.stdout:
+                stripped = line.strip()
+                if stripped.startswith("PROGRESS|"):
+                    # Machine-readable tick: feed the progress widget, keep out of log.
+                    job.set_progress(stripped[len("PROGRESS|"):])
+                    continue
                 job.append_log(line)
 
             while True:
@@ -404,6 +448,12 @@ class DownloadQueue:
             if wh:
                 event = "download_complete" if job.returncode == 0 else "download_failed"
                 wh.notify(event, record)
+
+            # Trigger the media library to pick up new audio.
+            if job.returncode == 0:
+                lib = _get_library()
+                if lib:
+                    lib.notify_changes()
 
 
 def split_urls(raw_urls: str) -> list[str]:
@@ -460,6 +510,7 @@ def default_archive_args(**overrides) -> argparse.Namespace:
         "yt_dlp": "yt-dlp",
         "normalize": "off",
         "normalize_target": -16.0,
+        "machine_progress": True,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -503,6 +554,7 @@ def form_to_archive_args(form: dict[str, list[str]]) -> argparse.Namespace:
         yt_dlp="yt-dlp",
         normalize=normalize,
         normalize_target=normalize_target,
+        machine_progress=True,
     )
 
 
@@ -771,6 +823,7 @@ PAGE_HTML = r"""<!doctype html>
     .card-accent-history .card-head h2::before { background: var(--text-3); }
     .card-accent-normalize .card-head h2::before { background: var(--purple); }
     .card-accent-telegram .card-head h2::before { background: #0088cc; }
+    .card-accent-library .card-head h2::before { background: #c5692e; }
     .badge {
       display: inline-flex; align-items: center; gap: 6px;
       font-size: 10px; font-weight: 800; padding: 3px 8px;
@@ -925,6 +978,63 @@ PAGE_HTML = r"""<!doctype html>
     .telegram-files::-webkit-scrollbar-track { background: transparent; }
     .telegram-files::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 3px; }
     .telegram-channels { max-height: 150px; overflow-y: auto; font-family: var(--mono); font-size: 12px; margin-top: 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+
+    /* Library */
+    .lib-list { max-height: 320px; overflow-y: auto; font-family: var(--mono); font-size: 12px; }
+    .lib-list::-webkit-scrollbar { width: 6px; }
+    .lib-list::-webkit-scrollbar-track { background: transparent; }
+    .lib-list::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 3px; }
+    .lib-artist, .lib-album { border-bottom: 1px solid var(--border-subtle); }
+    .lib-artist:last-child, .lib-album:last-child { border-bottom: none; }
+    .lib-artist summary, .lib-album summary {
+      cursor: pointer; list-style: none; display: flex; align-items: center;
+      justify-content: space-between; gap: 8px; user-select: none;
+    }
+    .lib-artist summary { padding: 10px 18px; font-weight: 650; color: var(--text); }
+    .lib-album summary { padding: 8px 18px 8px 30px; color: var(--text-2); }
+    .lib-artist summary::-webkit-details-marker, .lib-album summary::-webkit-details-marker { display: none; }
+    .lib-artist summary::before, .lib-album summary::before {
+      content: '\25B8'; color: var(--text-3); transition: transform .15s; flex-shrink: 0;
+    }
+    .lib-artist[open] > summary::before, .lib-album[open] > summary::before { transform: rotate(90deg); }
+    .lib-artist summary span, .lib-album summary span {
+      font-size: 10px; color: var(--text-3); background: var(--surface-2);
+      padding: 2px 7px; border-radius: 999px; flex-shrink: 0;
+    }
+    .lib-track { display: flex; align-items: center; gap: 9px; padding: 6px 18px 6px 44px; color: var(--text-2); border-bottom: 1px solid var(--border-subtle); }
+    .lib-track:hover { background: var(--surface-2); }
+    .lib-track:last-child { border-bottom: none; }
+    .lib-track-no { color: var(--text-3); width: 20px; flex-shrink: 0; text-align: right; }
+    .lib-play {
+      background: none; border: 1px solid var(--border); border-radius: 50%;
+      width: 22px; height: 22px; line-height: 1; cursor: pointer; flex-shrink: 0;
+      color: var(--text-2); font-size: 9px; display: grid; place-items: center;
+      transition: all .15s; padding: 0;
+    }
+    .lib-play:hover { background: var(--red); color: #fff; border-color: var(--red); }
+    .lib-track.playing { color: var(--red); }
+    .lib-track.playing .file-name { font-weight: 650; }
+    .lib-track.playing .lib-play { background: var(--red); color: #fff; border-color: var(--red); }
+    .lib-sub {
+      color: var(--text-3); font-size: 10px; margin-left: 8px; overflow: hidden;
+      text-overflow: ellipsis; white-space: nowrap; max-width: 40%;
+    }
+    .lib-flat-note { padding: 8px 18px; color: var(--text-3); font-size: 11px; }
+    .lib-more {
+      display: block; width: 100%; padding: 10px; background: var(--surface-2);
+      border: none; border-top: 1px solid var(--border-subtle); color: var(--blue);
+      font-family: var(--sans); font-size: 12px; cursor: pointer; text-align: center;
+    }
+    .lib-more:hover { background: var(--surface-3); }
+    .lib-player {
+      display: none; flex-direction: column; gap: 6px; padding: 12px 18px;
+      border-top: 1px solid var(--border-subtle); background: var(--surface-2);
+    }
+    .lib-player #lib-player-title {
+      font-size: 11px; font-weight: 600; color: var(--text);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .lib-player audio { width: 100%; height: 32px; }
     .norm-file-item {
       display: flex; align-items: center; gap: 10px; padding: 8px 12px;
       border-bottom: 1px solid var(--border-subtle); color: var(--text-2);
@@ -1367,6 +1477,27 @@ PAGE_HTML = r"""<!doctype html>
         </div>
       </div>
 
+      <!-- Media Library -->
+      <div class="card card-accent-library">
+        <div class="card-head">
+          <h2>Media Library</h2>
+          <span class="badge badge-idle" id="library-badge">0 tracks</span>
+        </div>
+        <div class="card-body" style="padding: 0;">
+          <div class="add-channel-row">
+            <input type="text" id="library-search" placeholder="Search artist, album, song...">
+            <button class="btn-add" onclick="rescanLibrary()">Rescan Library</button>
+          </div>
+          <div class="lib-list" id="library-list">
+            <div class="channels-empty">No library yet. New downloads are organized automatically.</div>
+          </div>
+          <div class="lib-player" id="lib-player">
+            <span id="lib-player-title"></span>
+            <audio id="lib-audio" controls preload="none"></audio>
+          </div>
+        </div>
+      </div>
+
       <!-- Normalize -->
       <div class="card card-accent-normalize">
         <div class="card-head">
@@ -1797,7 +1928,16 @@ PAGE_HTML = r"""<!doctype html>
             if (f) { currentFile = f; break; }
           }
 
-          if (filePct) {
+          // Preferred: server-parsed machine ticks (exact, includes speed/eta)
+          if (j.progress && typeof j.progress.pct === 'number') {
+            progressWrap.classList.add('active');
+            progressBar.style.width = Math.min(100, j.progress.pct) + '%';
+            progressPct.textContent = j.progress.pct.toFixed(1) + '%';
+            const bits = [];
+            if (j.progress.speed) bits.push(fmtSpeed(j.progress.speed));
+            if (j.progress.eta != null) bits.push('ETA ' + fmtEta(j.progress.eta));
+            if (bits.length) progressFile.textContent = bits.join(' \u00b7 ');
+          } else if (filePct) {
             progressWrap.classList.add('active');
             progressBar.style.width = filePct.pct + '%';
             progressPct.textContent = filePct.pct.toFixed(1) + '%';
@@ -1878,6 +2018,196 @@ PAGE_HTML = r"""<!doctype html>
         }).join('');
       } catch(e) {}
     }
+
+    // Media library
+    let libData = null;
+    let libSig = '';
+    let libQuery = '';
+    let libArtistLimit = 30;
+
+    function fmtSpeed(bps) {
+      return bps >= 1048576 ? (bps/1048576).toFixed(2) + ' MB/s' : (bps/1024).toFixed(0) + ' KB/s';
+    }
+    function fmtEta(secs) {
+      if (secs == null || secs <= 0) return '';
+      const h = Math.floor(secs/3600), m = Math.floor((secs%3600)/60), s = secs%60;
+      return h ? h + 'h ' + m + 'm' : m ? m + 'm ' + s + 's' : s + 's';
+    }
+
+    function libRow(t, artistName, albumName) {
+      const no = t.track_no != null ? String(t.track_no).padStart(2, '0') : '--';
+      const size = t.size >= 1048576 ? (t.size/1048576).toFixed(1) + ' MB' : (t.size/1024).toFixed(0) + ' KB';
+      const sub = libQuery ? '<span class="lib-sub">' + esc(artistName) + ' / ' + esc(albumName) + '</span>' : '';
+      return '<div class="lib-track" data-src="' + esc(t.src) + '" data-title="' + esc(t.title) + '">'
+        + '<button class="lib-play" title="Preview">&#9654;</button>'
+        + '<span class="lib-track-no">' + no + '</span>'
+        + '<span class="file-name" title="' + esc(t.src) + '">' + esc(t.title) + '</span>' + sub
+        + '<span class="file-size">' + size + '</span></div>';
+    }
+
+    function renderLibrary() {
+      const list = $('library-list');
+      const badge = $('library-badge');
+      const st = (libData && libData.stats) || {};
+      if (st.scanning) {
+        badge.className = 'badge badge-running';
+        badge.textContent = 'scanning';
+      } else {
+        badge.className = 'badge badge-count';
+        badge.textContent = st.total_tracks + ' track' + (st.total_tracks !== 1 ? 's' : '');
+      }
+      if (!libData || !libData.artists || libData.artists.length === 0) {
+        list.innerHTML = st.scanning
+          ? '<div class="channels-empty">Scanning library&hellip;</div>'
+          : '<div class="channels-empty">No library yet. New downloads are organized automatically.</div>';
+        return;
+      }
+
+      // Search mode: flat matching rows across the whole tree.
+      if (libQuery) {
+        const hits = [];
+        outer:
+        for (const a of libData.artists) {
+          for (const al of a.albums) {
+            for (const t of al.tracks) {
+              if ((a.name + ' ' + al.name + ' ' + t.title).toLowerCase().includes(libQuery)) {
+                hits.push([a.name, al.name, t]);
+                if (hits.length >= 300) break outer;
+              }
+            }
+          }
+        }
+        let html = '<div class="lib-flat-note">' + hits.length + (hits.length >= 300 ? '+' : '') + ' match(es)</div>';
+        for (const [an, aln, t] of hits) html += libRow(t, an, aln);
+        list.innerHTML = html || '<div class="channels-empty">No matches.</div>';
+        markPlaying();
+        return;
+      }
+
+      // Tree mode with artist pagination; remember open sections across renders.
+      const openKeys = new Set(
+        Array.from(list.querySelectorAll('details[open]')).map(d => d.dataset.key)
+      );
+      let html = '';
+      const shown = libData.artists.slice(0, libArtistLimit);
+      for (const a of shown) {
+        const akey = a.name;
+        html += '<details class="lib-artist" data-key="' + esc(akey) + '"' + (openKeys.has(akey) ? ' open' : '')
+          + '><summary>' + esc(a.name) + '<span>' + a.albums.length + '</span></summary>';
+        for (const al of a.albums) {
+          const kkey = akey + '\u0000' + al.name;
+          html += '<details class="lib-album" data-key="' + esc(kkey.replace('\u0000',' / ')) + '"' + (openKeys.has(al.name) && openKeys.has(akey) ? ' open' : '')
+            + '><summary>' + esc(al.name) + '<span>' + al.tracks.length + '</span></summary>';
+          for (const t of al.tracks) html += libRow(t, a.name, al.name);
+          html += '</details>';
+        }
+        html += '</details>';
+      }
+      const remaining = libData.artists.length - shown.length;
+      if (remaining > 0) {
+        html += '<button class="lib-more" onclick="libMore()">Show more artists (' + remaining + ' hidden)</button>';
+      }
+      list.innerHTML = html;
+      markPlaying();
+    }
+
+    function libMore() { libArtistLimit += 50; renderLibrary(); }
+
+    async function refreshLibrary() {
+      try {
+        const res = await fetch('/api/library', { cache: 'no-store' });
+        const data = await res.json();
+        const st = data.stats || {};
+        const sig = [st.total_tracks, st.total_artists, st.total_albums, st.scanning ? 's' : 'i'].join(':');
+        const changed = sig !== libSig;
+        libSig = sig;
+        libData = data;
+        // Skip DOM rebuild when nothing changed — preserves open sections,
+        // scroll position and playback state between polls.
+        if (!changed && !libQuery && $('library-list').querySelector('.lib-track')) {
+          updateLibBadgeOnly();
+          return;
+        }
+        renderLibrary();
+      } catch(e) {}
+    }
+
+    function updateLibBadgeOnly() {
+      const st = (libData && libData.stats) || {};
+      const badge = $('library-badge');
+      if (st.scanning) {
+        badge.className = 'badge badge-running';
+        badge.textContent = 'scanning';
+      } else {
+        badge.className = 'badge badge-count';
+        badge.textContent = st.total_tracks + ' track' + (st.total_tracks !== 1 ? 's' : '');
+      }
+    }
+
+    // Inline preview player
+    function libTogglePlay(row) {
+      const src = row.dataset.src;
+      const audio = $('lib-audio');
+      if (!src) return;
+      if (audio.dataset.src === src) {
+        if (audio.paused) audio.play(); else audio.pause();
+        return;
+      }
+      audio.dataset.src = src;
+      audio.src = '/audio?src=' + encodeURIComponent(src);
+      $('lib-player').style.display = 'flex';
+      $('lib-player-title').textContent = row.dataset.title || 'Preview';
+      audio.play();
+    }
+
+    function markPlaying() {
+      const audio = $('lib-audio');
+      const current = audio ? audio.dataset.src : null;
+      document.querySelectorAll('.lib-track.playing').forEach(el => {
+        el.classList.remove('playing');
+        const b = el.querySelector('.lib-play');
+        if (b) b.innerHTML = '&#9654;';
+      });
+      if (!current) return;
+      document.querySelectorAll('.lib-track[data-src]').forEach(el => {
+        if (el.dataset.src === current && audio && !audio.paused) {
+          el.classList.add('playing');
+          const b = el.querySelector('.lib-play');
+          if (b) b.innerHTML = '&#10074;&#10074;';
+        }
+      });
+    }
+
+    $('library-list').addEventListener('click', function(e) {
+      const row = e.target.closest('.lib-track');
+      if (!row) return;
+      libTogglePlay(row);
+    });
+
+    $('library-search').addEventListener('input', function() {
+      libQuery = this.value.trim().toLowerCase();
+      renderLibrary();
+    });
+
+    const libAudio = $('lib-audio');
+    libAudio.addEventListener('play', markPlaying);
+    libAudio.addEventListener('pause', markPlaying);
+    libAudio.addEventListener('ended', markPlaying);
+
+    async function rescanLibrary() {
+      try {
+        await fetch('/api/library/rescan', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body: 'csrf_token=' + encodeURIComponent(CSRF)
+        });
+        toast('Full library rescan started', 'info');
+        refreshLibrary();
+      } catch(e) {}
+    }
+
+    refreshLibrary();
+    setInterval(refreshLibrary, 8000);
 
     // Playlist detection + fetch
     let plTimer = null;
@@ -2487,7 +2817,7 @@ PAGE_HTML = r"""<!doctype html>
         if (data.files) {
           let totalSize = 0;
           for (const f of data.files) totalSize += f.size;
-          $('st-total-size').textContent = totalSize >= 1073741824 ? (totalSize/1073741824).toFixed(1) + ' GB' : totalSize >= 1048576 ? (totalSize/1048576).toFixed(1) + ' MB' : (totalSize/1024).toFixed(0) + ' KB';
+          $('st-total-size').textContent = totalSize === 0 ? '0 B' : totalSize >= 1073741824 ? (totalSize/1073741824).toFixed(1) + ' GB' : totalSize >= 1048576 ? (totalSize/1048576).toFixed(1) + ' MB' : (totalSize/1024).toFixed(0) + ' KB';
           $('st-file-count').textContent = data.files.length;
         }
       } catch(e) {}
@@ -2884,7 +3214,7 @@ def redirect(location: str) -> bytes:
     return f"Redirecting to {html.escape(location)}".encode("utf-8")
 
 
-def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor, webhook: WebhookManager, telegram_monitor: TelegramMonitor, allowed_hosts: set[str] | None = None):
+def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor, webhook: WebhookManager, telegram_monitor: TelegramMonitor, allowed_hosts: set[str] | None = None, media_library: MediaLibrary | None = None):
     class ArchiveRequestHandler(BaseHTTPRequestHandler):
         def _host_ok(self) -> bool:
             # DNS-rebinding defense: when enabled (server startup), only requests
@@ -3040,6 +3370,17 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
                     "exported_at": time.time(),
                 }
                 self.respond_json(data)
+                return
+
+            if self.path == "/api/library":
+                if media_library is None:
+                    self.respond_json({"artists": [], "stats": {"total_tracks": 0, "scanning": False}})
+                    return
+                self.respond_json(media_library.snapshot())
+                return
+
+            if self.path.startswith("/audio"):
+                self.serve_library_audio(media_library)
                 return
 
             if self.path == "/favicon.ico":
@@ -3254,9 +3595,13 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
                         break
                 if stored:
                     stored.pop("urls", None)
-                    args = argparse.Namespace(**stored, urls=[url])
+                    # Merge stored args over current defaults so entries saved by
+                    # older versions (missing newer fields) still build commands.
+                    base = vars(default_archive_args())
+                    base.update(stored)
+                    args = argparse.Namespace(**base, urls=[url])
                 else:
-                    args = default_archive_args(urls=[url])
+                    args = default_archive_args(urls=[url], machine_progress=True)
                 queue.enqueue(args, url=url, name=f"Retry: {name}" if name else "Retry")
                 self.respond_json({"ok": True})
                 return
@@ -3283,6 +3628,12 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
 
             if self.path == "/api/normalize/stop":
                 _normalize_worker.stop()
+                self.respond_json({"ok": True})
+                return
+
+            if self.path == "/api/library/rescan":
+                if media_library is not None:
+                    media_library.request_full_rescan()
                 self.respond_json({"ok": True})
                 return
 
@@ -3355,6 +3706,10 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
                         telegram_monitor.download_audio(int(channel), message_ids)
                     )
                     self.respond_json({"ok": True, "downloaded": len(downloaded), "files": downloaded})
+                    if downloaded:
+                        lib = _get_library()
+                        if lib:
+                            lib.notify_changes()
                 except Exception as e:
                     self.respond_json({"error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
                 return
@@ -3393,6 +3748,67 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
             self.end_headers()
             self.wfile.write(redirect("/"))
 
+        def serve_library_audio(self, lib: MediaLibrary | None) -> None:
+            """Stream a library-tracked audio file with HTTP Range support.
+
+            Only paths present in the library index are served — this is an
+            exact allowlist, not a path traversal surface.
+            """
+            parsed = urlparse(self.path)
+            qs = parse_qs(parsed.query)
+            src = first_value(qs, "src", "")
+            entry = lib.lookup_entry(src) if lib else None
+            if not entry:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+
+            p = Path(entry["src"])
+            try:
+                size = p.stat().st_size
+            except OSError:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+
+            start, end, partial = 0, size - 1, False
+            range_header = self.headers.get("Range", "")
+            m = re.match(r"bytes=(\d*)-(\d*)$", range_header.strip())
+            if m and (m.group(1) or m.group(2)):
+                if m.group(1):
+                    start = int(m.group(1))
+                if m.group(2):
+                    end = min(int(m.group(2)), size - 1)
+                else:
+                    end = size - 1
+                if start > end or start >= size:
+                    self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                partial = True
+
+            length = end - start + 1
+            self.send_response(HTTPStatus.PARTIAL_CONTENT if partial else HTTPStatus.OK)
+            if partial:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Type", AUDIO_MIME.get(Path(src).suffix.lower(), "application/octet-stream"))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(length))
+            self.end_headers()
+            try:
+                with p.open("rb") as f:
+                    f.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk = f.read(min(64 * 1024, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
         def respond_html(self, body: bytes, status: HTTPStatus = HTTPStatus.OK) -> None:
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -3425,6 +3841,16 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
     return ArchiveRequestHandler
 
 
+def port_number(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("must be between 1 and 65535")
+    return port
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the local YouTube archiver web UI.")
     parser.add_argument(
@@ -3438,7 +3864,7 @@ def build_parser() -> argparse.ArgumentParser:
             default_port = int(os.environ["PORT"])
         except ValueError:
             pass
-    parser.add_argument("--port", type=yt_archive.positive_int, default=default_port, help=f"Port to bind. Default: {DEFAULT_PORT} (or $PORT)")
+    parser.add_argument("--port", type=port_number, default=default_port, help=f"Port to bind. Default: {DEFAULT_PORT} (or $PORT)")
     return parser
 
 
@@ -3466,6 +3892,7 @@ trigger_playlist_download = lambda url, ch: _trigger_download(url, ch, "Auto Pla
 
 _queue_ref: DownloadQueue | None = None
 _webhook_ref: WebhookManager | None = None
+_library_ref: MediaLibrary | None = None
 
 
 def _get_queue() -> DownloadQueue | None:
@@ -3476,13 +3903,27 @@ def _get_webhook() -> WebhookManager | None:
     return _webhook_ref
 
 
+def _get_library() -> MediaLibrary | None:
+    return _library_ref
+
+
 def main(argv: list[str] | None = None) -> int:
-    global _queue_ref, _webhook_ref
+    global _queue_ref, _webhook_ref, _library_ref
     args = build_parser().parse_args(argv)
     queue = DownloadQueue()
     _queue_ref = queue
     webhook = WebhookManager()
     _webhook_ref = webhook
+
+    # Media library: auto-organizes new audio into Artist/Album/NN - Song.
+    library = MediaLibrary(
+        sources=("archive",),
+        library_dir=os.environ.get("LIBRARY_DIR", "library"),
+        index_path=os.environ.get("LIBRARY_INDEX", "library_index.json"),
+        log_callback=lambda msg: LOG.info(f"[library] {msg}"),
+    )
+    _library_ref = library
+    library.start()
 
     def on_new_video(url: str, channel: Channel):
         trigger_download(url, channel)
@@ -3508,14 +3949,16 @@ def main(argv: list[str] | None = None) -> int:
             "127.0.0.1", "localhost", "[::1]",
         }
 
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(queue, secrets.token_urlsafe(32), monitor, webhook, telegram_monitor, allowed_hosts=allowed_hosts))
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(queue, secrets.token_urlsafe(32), monitor, webhook, telegram_monitor, allowed_hosts=allowed_hosts, media_library=library))
     print(f"Open http://{args.host}:{args.port}")
     print(f"Channel monitor: {'running' if monitor.is_running else 'stopped'}")
+    print(f"Media library: organizing into {library.library_dir}/")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
         monitor.stop()
+        library.stop()
     finally:
         server.server_close()
     return 0

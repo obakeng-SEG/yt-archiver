@@ -4,6 +4,7 @@ import io
 import os
 import tempfile
 import unittest
+import urllib.parse
 from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,6 +53,12 @@ class TempCwdTestCase(unittest.TestCase):
         os.chdir(self._tmp.name)
         self.addCleanup(os.chdir, old_cwd)
         self.tmpdir = self._tmp.name
+
+    def touch(self, rel: str, content: bytes = b"x" * 2048) -> Path:
+        p = Path(self.tmpdir) / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(content)
+        return p
 
 
 class IsolatedHandlerTestCase(TempCwdTestCase):
@@ -533,6 +540,112 @@ class TelegramDedupeTests(TempCwdTestCase):
         self.assertIs(first, second)
         self.assertEqual(len(monitor.get_channels()), 1)
         self.assertEqual(second.name, "Renamed")
+
+
+class AudioEndpointTests(IsolatedHandlerTestCase):
+    def build_handler_with_library(self):
+        lib = web_ui.MediaLibrary(
+            sources=("archive",),
+            library_dir=os.path.join(self.tmpdir, "library"),
+            index_path=os.path.join(self.tmpdir, "library_index.json"),
+            poll_interval=3600.0,
+        )
+        handler_class = web_ui.make_handler(
+            make_test_queue(self.tmpdir), "tok",
+            web_ui.ChannelMonitor.load(channels_path=os.path.join(self.tmpdir, "channels.json")),
+            web_ui.WebhookManager(os.path.join(self.tmpdir, "webhooks.json")),
+            web_ui.TelegramMonitor(web_ui.TelegramConfig(), output_dir=self.tmpdir),
+            media_library=lib,
+        )
+        return handler_class, lib
+
+    def get_audio(self, handler_class, src, headers=None):
+        handler = handler_class.__new__(handler_class)
+        handler.path = "/audio?src=" + urllib.parse.quote(src, safe="")
+        handler.command = "GET"
+        handler.request_version = "HTTP/1.1"
+        handler.headers = headers or {}
+        output = io.BytesIO()
+        handler.wfile = output
+        sent_headers = {}
+        statuses = []
+        with mock.patch.object(handler, "send_response", side_effect=lambda s, m=None: statuses.append(s)), \
+             mock.patch.object(handler, "send_header", side_effect=lambda k, v: sent_headers.__setitem__(k, v)), \
+             mock.patch.object(handler, "end_headers"):
+            with contextlib.redirect_stderr(io.StringIO()):
+                handler.do_GET()
+        return sent_headers, output.getvalue(), statuses
+
+    def test_streams_full_file_with_allowlist(self):
+        import media_library as ml_mod
+
+        audio = self.tmpdir + "/archive/A/B/01 - Song [vid000000009].mp3"
+        self.touch(audio, b"0123456789abcdef")
+        handler_class, lib = self.build_handler_with_library()
+        # Index the file so it is allowlisted
+        with tempfile.TemporaryDirectory() as _:
+            pass
+        entry_src = str(Path(audio).resolve())
+        lib._entries[entry_src] = {
+            "src": entry_src, "artist": "A", "album": "B", "title": "Song",
+            "track_no": 1, "year": None, "ext": ".mp3", "size": 16,
+            "mtime_ns": 0, "hash": "x", "video_id": "vid000000009", "dest": "",
+            "source": "manual",
+        }
+
+        headers, body, statuses = self.get_audio(handler_class, audio)
+        self.assertEqual(statuses[0], HTTPStatus.OK)
+        self.assertEqual(headers["Content-Type"], "audio/mpeg")
+        self.assertEqual(headers["Accept-Ranges"], "bytes")
+        self.assertEqual(body, b"0123456789abcdef")
+
+    def test_range_request_returns_partial_content(self):
+        audio = self.tmpdir + "/archive/A/B/01 - Song [vid000000010].mp3"
+        self.touch(audio, b"0123456789abcdef")
+        handler_class, lib = self.build_handler_with_library()
+        entry_src = str(Path(audio).resolve())
+        lib._entries[entry_src] = {"src": entry_src, "ext": ".mp3", "size": 16}
+
+        headers, body, statuses = self.get_audio(
+            handler_class, audio, headers={"Range": "bytes=2-5"}
+        )
+        self.assertEqual(statuses[0], HTTPStatus.PARTIAL_CONTENT)
+        self.assertEqual(body, b"2345")
+        self.assertIn("Content-Range", headers)
+        self.assertTrue(headers["Content-Range"].startswith("bytes 2-5/"))
+
+    def test_untracked_path_is_rejected(self):
+        secret = self.touch("outside/secret.mp3", b"nope")
+        handler_class, _ = self.build_handler_with_library()
+        _headers, _body, statuses = self.get_audio(handler_class, str(secret))
+        self.assertEqual(statuses[0], HTTPStatus.NOT_FOUND)
+
+
+class RetryHardeningTests(IsolatedHandlerTestCase):
+    def test_retry_without_history_uses_current_defaults(self):
+        # Regression: stored history from older versions lacks newer fields
+        # (e.g. normalize, machine_progress); retry must merge over defaults.
+        handler_class, queue, _monitor = self.build_handler()
+        call = self.post(handler_class, "/queue/retry", {"url": "https://www.youtube.com/watch?v=abc123"})
+        self.assertTrue(call[0][0]["ok"])
+
+        job = queue._queue[0]
+        command = web_ui.yt_archive.build_ytdlp_command(job.args)  # must not raise
+        self.assertIn("--extract-audio", command)
+
+
+class PortClampTests(unittest.TestCase):
+    def test_rejects_out_of_range_ports(self):
+        for bad in ("0", "70000", "-1", "abc"):
+            parser = web_ui.build_parser()
+            with contextlib.redirect_stderr(io.StringIO()), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args(["--port", bad])
+
+    def test_accepts_valid_port(self):
+        args = web_ui.build_parser().parse_args(["--port", "65535"])
+        self.assertEqual(args.port, 65535)
 
 
 if __name__ == "__main__":
