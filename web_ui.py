@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hmac
 import html
 import json
@@ -11,7 +12,6 @@ import logging
 import os
 import secrets
 import shlex
-import shutil
 import subprocess
 import threading
 import time
@@ -25,6 +25,7 @@ import yt_archive
 from monitor import ChannelMonitor, MonitorConfig, Channel
 from webhook import WebhookManager
 from telegram_monitor import TelegramMonitor, TelegramConfig, load_telegram_config, save_telegram_config
+from utils import atomic_write_text
 
 LOG = logging.getLogger("web_ui")
 
@@ -88,18 +89,53 @@ class ArchiveJob:
 
 
 class DownloadQueue:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        history_path: str = "download_history.json",
+        state_path: str = "queue_state.json",
+        autostart_worker: bool = True,
+    ) -> None:
         self._lock = threading.Lock()
         self._queue: list[ArchiveJob] = []
         self._current: ArchiveJob | None = None
         self._history: list[dict] = []
-        self._history_file = Path("download_history.json")
-        self._load_history()
+        self._history_file = Path(history_path)
+        self._state_file = Path(state_path)
+        # Test hook: when False, enqueue() never spawns the worker thread.
+        self._autostart_worker = autostart_worker
         self._quiet_start: int = 23  # hour (0-23)
         self._quiet_end: int = 7    # hour (0-23)
         self._quiet_enabled: bool = False
+        self._load_history()
+        # Must run AFTER quiet-hour defaults are set (it overwrites them).
+        self._load_state()
         self._worker_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+
+    def _load_state(self):
+        """Restore persisted settings (quiet hours) across restarts."""
+        if not self._state_file.exists():
+            return
+        try:
+            data = json.loads(self._state_file.read_text())
+            quiet = data.get("quiet_hours", {})
+            self._quiet_start = max(0, min(23, int(quiet.get("start", 23))))
+            self._quiet_end = max(0, min(23, int(quiet.get("end", 7))))
+            self._quiet_enabled = bool(quiet.get("enabled", False))
+        except Exception as e:
+            LOG.warning(f"Could not load queue state: {e}")
+
+    def _save_state(self):
+        try:
+            atomic_write_text(self._state_file, json.dumps({
+                "quiet_hours": {
+                    "start": self._quiet_start,
+                    "end": self._quiet_end,
+                    "enabled": self._quiet_enabled,
+                }
+            }, indent=2))
+        except Exception as e:
+            LOG.warning(f"Could not save queue state: {e}")
 
     def _load_history(self):
         if self._history_file.exists():
@@ -110,7 +146,7 @@ class DownloadQueue:
                 self._history = []
 
     def _save_history(self):
-        self._history_file.write_text(json.dumps(self._history[-500:], indent=2))
+        atomic_write_text(self._history_file, json.dumps(self._history[-500:], indent=2))
 
     def _is_quiet_hours(self) -> bool:
         if not self._quiet_enabled:
@@ -125,6 +161,7 @@ class DownloadQueue:
             self._quiet_start = max(0, min(23, start))
             self._quiet_end = max(0, min(23, end))
             self._quiet_enabled = enabled
+        self._save_state()
 
     def get_quiet_hours(self) -> dict:
         with self._lock:
@@ -139,7 +176,8 @@ class DownloadQueue:
         job = ArchiveJob(command, args.output_dir, download_archive=args.download_archive, url=url, name=name, args=args)
         with self._lock:
             self._queue.append(job)
-        self._ensure_worker()
+        if self._autostart_worker:
+            self._ensure_worker()
         return job
 
     def _ensure_worker(self):
@@ -249,13 +287,17 @@ class DownloadQueue:
                 if not line or not line.startswith("youtube "):
                     continue
                 vid = line.split(" ", 1)[1]
-                if not any(vid in fname for fname in file_index):
+                # Match the "[video_id]" token produced by DEFAULT_OUTPUT_TEMPLATE.
+                # A bare substring check false-positives when one ID is contained
+                # inside another filename, which would wrongly clean archive entries
+                # and trigger duplicate re-downloads.
+                marker = f"[{vid}]"
+                if not any(marker in fname for fname in file_index):
                     missing.append(vid)
         return missing
 
     def clean_archive(self, missing_ids: list[str], archive_file: str = "archive/downloaded.txt") -> int:
         """Remove missing video IDs from archive file atomically. Returns count removed."""
-        import tempfile
         archive_path = Path(archive_file).expanduser()
         if not archive_path.exists():
             return 0
@@ -272,18 +314,7 @@ class DownloadQueue:
                     continue
             kept.append(line)
 
-        # Atomic write via temp file
-        tmp_fd, tmp_path = tempfile.mkstemp(dir=archive_path.parent, suffix=".tmp")
-        try:
-            with os.fdopen(tmp_fd, "w") as tmp:
-                tmp.write("\n".join(kept) + "\n" if kept else "")
-            os.replace(tmp_path, archive_path)
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        atomic_write_text(archive_path, "\n".join(kept) + "\n" if kept else "")
         return removed
 
     def rescan_and_queue(self, output_dir: str = "archive", archive_file: str = "archive/downloaded.txt") -> int:
@@ -293,20 +324,20 @@ class DownloadQueue:
             return 0
         self.clean_archive(missing, archive_file)
         # Queue re-downloads for each missing video
+        out_prefix = str(Path(output_dir)) + "/"
         for vid in missing:
             url = f"https://www.youtube.com/watch?v={vid}"
-            args = argparse.Namespace(
+            # build_ytdlp_command resolves a relative archive path under
+            # output_dir, so strip the output_dir prefix to avoid doubling
+            # (archive/archive/downloaded.txt).
+            archive_for_cmd = archive_file
+            if not Path(archive_file).is_absolute() and archive_file.startswith(out_prefix):
+                archive_for_cmd = archive_file[len(out_prefix):]
+            args = default_archive_args(
                 urls=[url],
                 output_dir=output_dir,
-                audio_format="mp3",
                 audio_bitrate="192k",
-                audio_quality="0",
-                download_archive=archive_file,
-                limit=None,
-                playlist_items=None,
-                no_sidecar_metadata=False,
-                dry_run=False,
-                yt_dlp="yt-dlp",
+                download_archive=archive_for_cmd,
             )
             self.enqueue(args, url=url, name=f"Rescan: {vid}")
         return len(missing)
@@ -398,6 +429,42 @@ def safe_path(value: str, label: str) -> str:
     return str(check)
 
 
+def resolve_browsable(path: str) -> str:
+    """Clamp filesystem browsing to $HOME and the local ./archive directory."""
+    target = Path(path).expanduser().resolve()
+    home = Path.home().resolve()
+    archive = Path("archive").resolve()
+    if not (target == home or home in target.parents or target == archive or archive in target.parents):
+        return str(home)
+    return str(target)
+
+
+def default_archive_args(**overrides) -> argparse.Namespace:
+    """Complete yt-dlp args namespace matching build_ytdlp_command's expectations.
+
+    Every place that constructs archive args programmatically (monitor callbacks,
+    rescan, retry fallback) must use this so newly added fields don't get dropped.
+    """
+    values = {
+        "urls": [],
+        "output_dir": "archive",
+        "audio_format": "mp3",
+        "audio_bitrate": None,
+        "audio_quality": "0",
+        # Relative paths are resolved under output_dir by yt_archive (same as CLI).
+        "download_archive": "downloaded.txt",
+        "limit": None,
+        "playlist_items": None,
+        "no_sidecar_metadata": False,
+        "dry_run": False,
+        "yt_dlp": "yt-dlp",
+        "normalize": "off",
+        "normalize_target": -16.0,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
 def form_to_archive_args(form: dict[str, list[str]]) -> argparse.Namespace:
     output_dir = safe_path(first_value(form, "output_dir", "archive").strip() or "archive", "Output directory")
     archive_file = safe_path(first_value(form, "download_archive", "downloaded.txt").strip() or "downloaded.txt", "Download archive")
@@ -483,7 +550,7 @@ class NormalizeWorker:
         with self._lock:
             return self._progress
 
-    def start(self, files: list[str], norm_type: str, target: float, output_dir: str) -> None:
+    def start(self, files: list[str], norm_type: str, target: float, output_dir: str) -> bool:
         with self._lock:
             if self._running:
                 return False
@@ -514,6 +581,11 @@ class NormalizeWorker:
             try:
                 p = Path(filepath)
                 dest = out / p.name
+                # Never write over the source file in place — ffmpeg refuses
+                # "output same as input" and it would destroy the original.
+                if dest.exists() and dest.resolve() == p.resolve():
+                    failed += 1
+                    continue
                 if norm_type == "ebu":
                     af = f"loudnorm=I={target}:TP=-1.5:LRA=11"
                 elif norm_type == "peak":
@@ -523,9 +595,9 @@ class NormalizeWorker:
                 else:
                     af = None
                 if af:
-                    cmd = ["ffmpeg", "-y", "-i", str(p), "-af", af, str(dest)]
+                    cmd = ["ffmpeg", "-y", "-i", str(p), "-af", af, "-map_metadata", "0", str(dest)]
                 else:
-                    cmd = ["ffmpeg", "-y", "-i", str(p), "-c", "copy", str(dest)]
+                    cmd = ["ffmpeg", "-y", "-i", str(p), "-c", "copy", "-map_metadata", "0", str(dest)]
                 subprocess.run(cmd, check=True, capture_output=True)
                 succeeded += 1
             except Exception:
@@ -536,25 +608,6 @@ class NormalizeWorker:
 
 
 _normalize_worker = NormalizeWorker()
-
-
-def get_storage_stats(output_dir: str) -> dict[str, object]:
-    root = Path(output_dir).expanduser()
-    if not root.exists():
-        return {"total_size": 0, "file_count": 0, "dir_count": 0}
-    total_size = 0
-    file_count = 0
-    dir_count = 0
-    for p in root.rglob("*"):
-        if p.is_file():
-            try:
-                total_size += p.stat().st_size
-                file_count += 1
-            except OSError:
-                pass
-        elif p.is_dir():
-            dir_count += 1
-    return {"total_size": total_size, "file_count": file_count, "dir_count": dir_count}
 
 
 def browse_filesystem(path: str) -> dict[str, object]:
@@ -579,7 +632,7 @@ def fetch_playlist_items(url: str) -> list[dict[str, str]]:
     try:
         result = subprocess.run(
             [yt_archive.YT_DLP_PATH, "--flat-playlist", "--dump-json", "--no-warnings", url],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=120,
         )
         if result.returncode != 0:
             return []
@@ -641,6 +694,18 @@ PAGE_HTML = r"""<!doctype html>
       --radius-sm: 6px;
       --shadow: 0 1px 2px rgba(0,0,0,.04), 0 4px 12px rgba(0,0,0,.06);
       --shadow-lg: 0 2px 4px rgba(0,0,0,.04), 0 12px 32px rgba(0,0,0,.08);
+    }
+    [data-theme="dark"] {
+      --bg: #1a1714;
+      --bg-subtle: #231f1b;
+      --surface: #2a2520;
+      --surface-2: #332e29;
+      --surface-3: #3d3833;
+      --border: #4a443e;
+      --border-subtle: #3d3833;
+      --text: #e8e4de;
+      --text-2: #b5afa8;
+      --text-3: #8a847e;
     }
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -1115,6 +1180,7 @@ PAGE_HTML = r"""<!doctype html>
         <h1>yt-archiver <span>/ archive</span></h1>
       </div>
       <div class="header-right">
+        <button id="theme-toggle" onclick="toggleTheme()" style="background:none;border:1px solid var(--border);border-radius:999px;padding:4px 10px;cursor:pointer;font-size:12px;color:var(--text-2);">Dark</button>
         <span class="dot" id="live-dot"></span>
         <span id="header-status">idle</span>
       </div>
@@ -1292,6 +1358,9 @@ PAGE_HTML = r"""<!doctype html>
           <span class="badge badge-idle" id="files-badge">0 files</span>
         </div>
         <div class="card-body" style="padding: 0;">
+          <div style="padding: 8px 12px; border-bottom: 1px solid var(--border-subtle);">
+            <input type="text" id="file-search" placeholder="Search files..." style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface-2);color:var(--text);font-size:12px;font-family:var(--mono);outline:none;">
+          </div>
           <div class="files-list" id="files-list">
             <div class="files-empty">No files archived yet.</div>
           </div>
@@ -1393,6 +1462,23 @@ PAGE_HTML = r"""<!doctype html>
           </div>
           <div class="telegram-files" id="telegram-files">
             <div class="files-empty">Select a channel to browse audio files.</div>
+          </div>
+          <div id="tg-auth" style="display:none; margin-top:12px; padding:12px; background:var(--surface-2); border-radius:var(--radius-sm); border:1px solid var(--border);">
+            <div id="tg-auth-phone" style="display:none;">
+              <label style="font-size:12px; font-weight:600; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:6px; display:block;">Phone Number</label>
+              <div style="display:flex; gap:8px;">
+                <input type="tel" id="tg-phone-input" placeholder="+1234567890" style="flex:1; padding:8px 12px; border:1px solid var(--border); border-radius:var(--radius-sm); font-family:var(--mono); font-size:13px;">
+                <button type="button" class="btn btn-primary" onclick="submitTelegramPhone()" style="min-width:80px;">Send Code</button>
+              </div>
+            </div>
+            <div id="tg-auth-code" style="display:none;">
+              <label style="font-size:12px; font-weight:600; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:6px; display:block;">Verification Code</label>
+              <div style="display:flex; gap:8px;">
+                <input type="text" id="tg-code-input" placeholder="12345" style="flex:1; padding:8px 12px; border:1px solid var(--border); border-radius:var(--radius-sm); font-family:var(--mono); font-size:13px;">
+                <button type="button" class="btn btn-primary" onclick="submitTelegramCode()" style="min-width:80px;">Verify</button>
+              </div>
+            </div>
+            <div id="tg-auth-status" style="font-size:12px; color:var(--text-muted); margin-top:4px;"></div>
           </div>
         </div>
       </div>
@@ -1498,6 +1584,42 @@ PAGE_HTML = r"""<!doctype html>
             </div>
           </div>
         </div>
+      </div>
+
+      <div class="card" style="grid-column: 1 / -1;">
+        <div class="card-head">
+          <h2>Export / Import</h2>
+        </div>
+        <div class="card-body">
+          <div class="row row-2">
+            <div>
+              <button class="btn btn-ghost" onclick="exportData()" style="width:100%;">Export Archive Data</button>
+              <div style="font-size:11px;color:var(--text-3);margin-top:4px;">Download archive file list + download history as JSON</div>
+            </div>
+            <div>
+              <button class="btn btn-ghost" onclick="showImportModal()" style="width:100%;">Import URLs</button>
+              <div style="font-size:11px;color:var(--text-3);margin-top:4px;">Queue a list of YouTube URLs (one per line)</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Import Modal -->
+  <div class="modal-overlay" id="import-modal">
+    <div class="modal">
+      <div class="modal-head">
+        <h3>Import YouTube URLs</h3>
+        <button class="modal-close" onclick="closeImportModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <textarea id="import-urls" rows="10" placeholder="https://www.youtube.com/watch?v=...&#10;https://youtu.be/...&#10;# lines starting with # are ignored" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface-2);color:var(--text);font-family:var(--mono);font-size:12px;resize:vertical;"></textarea>
+        <div style="margin-top:6px;font-size:11px;color:var(--text-3);">One URL per line. Lines starting with # are skipped.</div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" onclick="closeImportModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="importUrls()">Import & Queue</button>
       </div>
     </div>
   </div>
@@ -1609,7 +1731,11 @@ PAGE_HTML = r"""<!doctype html>
     }
 
     function esc(s) {
-      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      // Escapes text AND attribute contexts (quotes included) — content
+      // rendered here comes from attacker-controllable sources (video titles,
+      // filenames), so quote escaping is mandatory to prevent XSS.
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                      .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
     }
 
     let lastLogLen = 0;
@@ -1823,10 +1949,12 @@ PAGE_HTML = r"""<!doctype html>
 
     // File browser
     let browserCurrentPath = '/Users';
+    let browserTargetId = 'output_dir';
 
-    async function openBrowser() {
+    async function openBrowser(targetId) {
+      browserTargetId = targetId || 'output_dir';
       $('browser-modal').classList.add('active');
-      await loadDir($('output_dir').value || '/');
+      await loadDir($(browserTargetId).value || '/');
     }
 
     function closeBrowser() { $('browser-modal').classList.remove('active'); }
@@ -1839,11 +1967,10 @@ PAGE_HTML = r"""<!doctype html>
         $('browser-path').textContent = data.path;
         let html = '';
         if (data.parent) {
-          html += '<div class="dir-item" onclick="loadDir(' + "'" + data.parent.replace(/'/g, "\\'") + "'" + ')"><span class="dir-icon">&#128193;</span>..</div>';
+          html += '<div class="dir-item" data-path="' + esc(data.parent) + '"><span class="dir-icon">&#128193;</span>..</div>';
         }
         for (const d of data.dirs) {
-          const escaped = d.path.replace(/'/g, "\\'");
-          html += '<div class="dir-item" onclick="loadDir(' + "'" + escaped + "'" + ')"><span class="dir-icon">&#128193;</span>' + esc(d.name) + '</div>';
+          html += '<div class="dir-item" data-path="' + esc(d.path) + '"><span class="dir-icon">&#128193;</span>' + esc(d.name) + '</div>';
         }
         if (!data.dirs.length && !data.parent) {
           html = '<div class="empty-state">No subdirectories found.</div>';
@@ -1854,8 +1981,14 @@ PAGE_HTML = r"""<!doctype html>
       }
     }
 
+    // Event delegation: one listener survives every re-render (no inline onclick).
+    $('browser-list').addEventListener('click', function(e) {
+      const item = e.target.closest('.dir-item');
+      if (item && item.dataset.path) loadDir(item.dataset.path);
+    });
+
     function browserSelect() {
-      $('output_dir').value = browserCurrentPath;
+      $(browserTargetId).value = browserCurrentPath;
       closeBrowser();
     }
 
@@ -2288,7 +2421,7 @@ PAGE_HTML = r"""<!doctype html>
           const ok = item.returncode === 0;
           const realIdx = data.history.length - 1 - idx;
           const retryBtn = !ok && item.url
-            ? ' <button class="history-retry" onclick="retryFailed(\'' + esc(item.url).replace(/'/g, "\\'") + '\', \'' + esc(item.name || '').replace(/'/g, "\\'") + '\')">Retry</button>'
+            ? ' <button class="history-retry" data-url="' + esc(item.url) + '" data-name="' + esc(item.name || '') + '">Retry</button>'
             : '';
           return '<div class="history-item">' +
             '<span class="history-dot ' + (ok ? 'ok' : 'fail') + '"></span>' +
@@ -2315,6 +2448,12 @@ PAGE_HTML = r"""<!doctype html>
         }
       } catch(e) {}
     }
+
+    // Delegated retry clicks (buttons are re-rendered on every poll)
+    $('history-list').addEventListener('click', function(e) {
+      const btn = e.target.closest('.history-retry');
+      if (btn && btn.dataset.url) retryFailed(btn.dataset.url, btn.dataset.name);
+    });
 
     // Quiet hours
     async function loadQuietHours() {
@@ -2471,24 +2610,58 @@ PAGE_HTML = r"""<!doctype html>
 
     // Telegram functions
     let tgFiles = [];
+    let tgPhone = '';
 
-    async function connectTelegram() {
+    async function connectTelegram(phone, code) {
       try {
+        const parts = ['csrf_token=' + encodeURIComponent(CSRF)];
+        if (phone) parts.push('phone=' + encodeURIComponent(phone));
+        if (code) parts.push('code=' + encodeURIComponent(code));
         const res = await fetch('/telegram/connect', {
           method: 'POST',
           headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-          body: 'csrf_token=' + encodeURIComponent(CSRF)
+          body: parts.join('&')
         });
         const data = await res.json();
-        if (data.ok) {
-          toast('Connected to Telegram', 'ok');
+
+        if (data.status === 'awaiting_phone') {
+          $('tg-auth').style.display = 'block';
+          $('tg-auth-phone').style.display = 'block';
+          $('tg-auth-code').style.display = 'none';
+          $('tg-auth-status').textContent = 'Enter your phone number to receive a verification code.';
+          $('tg-phone-input').focus();
+
+        } else if (data.status === 'awaiting_code') {
+          tgPhone = phone;
+          $('tg-auth-phone').style.display = 'none';
+          $('tg-auth-code').style.display = 'block';
+          $('tg-auth-status').textContent = 'Code sent! Enter the verification code from Telegram.';
+          $('tg-code-input').focus();
+
+        } else if (data.status === 'connected') {
+          toast('Connected to Telegram as ' + (data.name || ''), 'ok');
           $('telegram-badge').className = 'badge badge-ok';
           $('telegram-badge').textContent = 'connected';
+          $('tg-auth').style.display = 'none';
           refreshTelegramChannels();
-        } else {
+
+        } else if (data.status === 'error') {
           toast(data.error || 'Failed to connect', 'err');
+          $('tg-auth-status').textContent = data.error || 'Connection failed.';
         }
       } catch(e) { toast('Failed to connect', 'err'); }
+    }
+
+    function submitTelegramPhone() {
+      const phone = $('tg-phone-input').value.trim();
+      if (!phone) { toast('Enter a phone number', 'err'); return; }
+      connectTelegram(phone, null);
+    }
+
+    function submitTelegramCode() {
+      const code = $('tg-code-input').value.trim();
+      if (!code) { toast('Enter the verification code', 'err'); return; }
+      connectTelegram(tgPhone, code);
     }
 
     async function disconnectTelegram() {
@@ -2629,6 +2802,69 @@ PAGE_HTML = r"""<!doctype html>
         badge.textContent = 'disconnected';
       }
     }).catch(() => {});
+
+    // Dark mode toggle
+    function toggleTheme() {
+      const dark = document.documentElement.getAttribute('data-theme') === 'dark';
+      document.documentElement.setAttribute('data-theme', dark ? '' : 'dark');
+      localStorage.setItem('theme', dark ? 'light' : 'dark');
+      $('theme-toggle').textContent = dark ? 'Dark' : 'Light';
+    }
+    if (localStorage.getItem('theme') === 'dark') {
+      document.documentElement.setAttribute('data-theme', 'dark');
+      setTimeout(() => { const b = $('theme-toggle'); if (b) b.textContent = 'Light'; }, 0);
+    }
+
+    // File search
+    $('file-search').addEventListener('input', function() {
+      const q = this.value.toLowerCase();
+      const items = $('files-list').querySelectorAll('.file-item');
+      items.forEach(item => {
+        const name = item.querySelector('.file-name');
+        item.style.display = (name && name.textContent.toLowerCase().includes(q)) ? '' : 'none';
+      });
+    });
+
+    // Export / Import
+    async function exportData() {
+      try {
+        const res = await fetch('/api/export');
+        const data = await res.json();
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'yt-archiver-export-' + new Date().toISOString().slice(0,10) + '.json';
+        a.click();
+        URL.revokeObjectURL(url);
+        toast('Export downloaded', 'ok');
+      } catch(e) { toast('Export failed', 'err'); }
+    }
+
+    function showImportModal() { $('import-modal').classList.add('active'); }
+    function closeImportModal() { $('import-modal').classList.remove('active'); }
+
+    async function importUrls() {
+      const urls = $('import-urls').value.trim();
+      if (!urls) { toast('No URLs provided', 'err'); return; }
+      try {
+        const body = 'csrf_token=' + encodeURIComponent(CSRF) + '&urls=' + encodeURIComponent(urls);
+        const res = await fetch('/api/import', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body: body
+        });
+        const data = await res.json();
+        if (data.ok) {
+          toast('Queued ' + data.queued + ' URL(s)', 'ok');
+          closeImportModal();
+          $('import-urls').value = '';
+          refreshQueue();
+        } else {
+          toast(data.error || 'Import failed', 'err');
+        }
+      } catch(e) { toast('Import failed', 'err'); }
+    }
   </script>
 </body>
 </html>
@@ -2648,9 +2884,19 @@ def redirect(location: str) -> bytes:
     return f"Redirecting to {html.escape(location)}".encode("utf-8")
 
 
-def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor, webhook: WebhookManager, telegram_monitor: TelegramMonitor):
+def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor, webhook: WebhookManager, telegram_monitor: TelegramMonitor, allowed_hosts: set[str] | None = None):
     class ArchiveRequestHandler(BaseHTTPRequestHandler):
+        def _host_ok(self) -> bool:
+            # DNS-rebinding defense: when enabled (server startup), only requests
+            # whose Host header matches the bound address are served.
+            if allowed_hosts is None:
+                return True
+            return self.headers.get("Host", "") in allowed_hosts
+
         def do_GET(self) -> None:
+            if not self._host_ok():
+                self.respond_json({"error": "Invalid Host header"}, status=HTTPStatus.FORBIDDEN)
+                return
             if self.path == "/" or self.path.startswith("/?"):
                 self.respond_html(render_page(csrf_token=csrf_token))
                 return
@@ -2695,13 +2941,7 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
                 parsed = urlparse(self.path)
                 qs = parse_qs(parsed.query)
                 path = first_value(qs, "path", str(Path.home()))
-                # Restrict browse to home directory and archive
-                target = Path(path).expanduser().resolve()
-                home = Path.home().resolve()
-                archive = Path("archive").resolve()
-                if not (target == home or home in target.parents or target == archive or archive in target.parents):
-                    path = str(home)
-                self.respond_json(browse_filesystem(path))
+                self.respond_json(browse_filesystem(resolve_browsable(path)))
                 return
 
             if self.path.startswith("/playlist"):
@@ -2736,7 +2976,7 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
                 parsed = urlparse(self.path)
                 qs = parse_qs(parsed.query)
                 dir_path = first_value(qs, "dir", "archive")
-                dir_path = str(Path(dir_path).expanduser().resolve())
+                dir_path = resolve_browsable(dir_path)
                 exts = ("*.mp3", "*.m4a", "*.opus", "*.flac", "*.wav", "*.vorbis")
                 files = []
                 seen: set[Path] = set()
@@ -2760,8 +3000,14 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
                 return
 
             if self.path == "/telegram/status":
-                connected = telegram_monitor._client is not None and telegram_monitor._client.is_connected()
-                self.respond_json({"connected": connected})
+                try:
+                    connected = telegram_monitor._client is not None
+                    authorized = False
+                    if connected and telegram_monitor._loop:
+                        authorized = telegram_monitor.run_async(telegram_monitor._client.is_user_authorized())
+                    self.respond_json({"connected": connected and authorized})
+                except Exception:
+                    self.respond_json({"connected": False})
                 return
 
             if self.path == "/telegram/channels":
@@ -2776,15 +3022,24 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
                     self.respond_json({"files": []})
                     return
                 try:
-                    import asyncio
-                    loop = asyncio.new_event_loop()
-                    files = loop.run_until_complete(
+                    files = telegram_monitor.run_async(
                         telegram_monitor.browse_channel_audio(int(channel))
                     )
-                    loop.close()
                     self.respond_json({"files": files})
                 except Exception as e:
                     self.respond_json({"error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
+            if self.path == "/api/export":
+                output_dir = "archive"
+                files = list_archive_files(output_dir)
+                history = queue.history_snapshot()
+                data = {
+                    "files": files,
+                    "history": history,
+                    "exported_at": time.time(),
+                }
+                self.respond_json(data)
                 return
 
             if self.path == "/favicon.ico":
@@ -2794,6 +3049,9 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
             self.send_error(HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
+            if not self._host_ok():
+                self.respond_json({"error": "Invalid Host header"}, status=HTTPStatus.FORBIDDEN)
+                return
             if self.path == "/stop":
                 length = int(self.headers.get("content-length", "0"))
                 if length > MAX_BODY_SIZE:
@@ -2890,9 +3148,15 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
             if self.path == "/channels/quality":
                 url = first_value(form, "url", "")
                 audio_format = first_value(form, "audio_format", "mp3")
-                audio_bitrate = first_value(form, "audio_bitrate", "192k")
+                # Empty/missing -> default; otherwise strict allowlist. This value is
+                # later interpolated into yt-dlp postprocessor args, so an unvalidated
+                # string would be ffmpeg argument injection.
+                audio_bitrate = first_value(form, "audio_bitrate", "").strip() or "192k"
                 if audio_format not in yt_archive.AUDIO_FORMATS:
                     self.respond_json({"error": "Invalid format"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                if audio_bitrate not in yt_archive.AUDIO_BITRATES:
+                    self.respond_json({"error": "Invalid bitrate"}, status=HTTPStatus.BAD_REQUEST)
                     return
                 if monitor.set_channel_quality(url, audio_format, audio_bitrate):
                     self.respond_json({"ok": True})
@@ -2992,19 +3256,7 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
                     stored.pop("urls", None)
                     args = argparse.Namespace(**stored, urls=[url])
                 else:
-                    args = argparse.Namespace(
-                        urls=[url],
-                        output_dir="archive",
-                        audio_format="mp3",
-                        audio_bitrate="192k",
-                        audio_quality="0",
-                        download_archive="archive/downloaded.txt",
-                        limit=None,
-                        playlist_items=None,
-                        no_sidecar_metadata=False,
-                        dry_run=False,
-                        yt_dlp="yt-dlp",
-                    )
+                    args = default_archive_args(urls=[url])
                 queue.enqueue(args, url=url, name=f"Retry: {name}" if name else "Retry")
                 self.respond_json({"ok": True})
                 return
@@ -3036,24 +3288,19 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
 
             if self.path == "/telegram/connect":
                 try:
-                    import asyncio
-                    loop = asyncio.new_event_loop()
-                    result = loop.run_until_complete(telegram_monitor.connect())
-                    loop.close()
-                    if result:
-                        self.respond_json({"ok": True})
-                    else:
-                        self.respond_json({"error": "Failed to connect"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    phone = first_value(form, "phone", "").strip()
+                    code = first_value(form, "code", "").strip()
+                    result = telegram_monitor.run_async(
+                        telegram_monitor.connect(phone=phone or None, code=code or None)
+                    )
+                    self.respond_json(result)
                 except Exception as e:
-                    self.respond_json({"error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    self.respond_json({"status": "error", "error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
                 return
 
             if self.path == "/telegram/disconnect":
                 try:
-                    import asyncio
-                    loop = asyncio.new_event_loop()
-                    loop.run_until_complete(telegram_monitor.disconnect())
-                    loop.close()
+                    telegram_monitor.run_async(telegram_monitor.disconnect())
                     self.respond_json({"ok": True})
                 except Exception as e:
                     self.respond_json({"error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -3065,11 +3312,8 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
                     self.respond_json({"error": "Channel is required"}, status=HTTPStatus.BAD_REQUEST)
                     return
                 try:
-                    import asyncio
-                    loop = asyncio.new_event_loop()
-                    # Get channel info
                     if telegram_monitor._client:
-                        entity = loop.run_until_complete(telegram_monitor._client.get_entity(channel))
+                        entity = telegram_monitor.run_async(telegram_monitor._client.get_entity(channel))
                         ch = telegram_monitor.add_channel(
                             channel_id=entity.id,
                             name=getattr(entity, "title", channel),
@@ -3078,7 +3322,6 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
                         self.respond_json({"ok": True, "channel": {"id": ch.channel_id, "name": ch.name}})
                     else:
                         self.respond_json({"error": "Not connected to Telegram"}, status=HTTPStatus.BAD_REQUEST)
-                    loop.close()
                 except Exception as e:
                     self.respond_json({"error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
                 return
@@ -3108,15 +3351,30 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
                     self.respond_json({"error": "Invalid message IDs"}, status=HTTPStatus.BAD_REQUEST)
                     return
                 try:
-                    import asyncio
-                    loop = asyncio.new_event_loop()
-                    downloaded = loop.run_until_complete(
+                    downloaded = telegram_monitor.run_async(
                         telegram_monitor.download_audio(int(channel), message_ids)
                     )
-                    loop.close()
                     self.respond_json({"ok": True, "downloaded": len(downloaded), "files": downloaded})
                 except Exception as e:
                     self.respond_json({"error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
+            if self.path == "/api/import":
+                csv_data = first_value(form, "urls", "")
+                if not csv_data:
+                    self.respond_json({"error": "No URLs provided"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                lines = [l.strip() for l in csv_data.splitlines() if l.strip() and not l.startswith("#")]
+                queued = 0
+                for url in lines:
+                    if url.startswith("http"):
+                        try:
+                            args = form_to_archive_args({"urls": [url], "output_dir": ["archive"], "audio_format": ["mp3"], "download_archive": ["downloaded.txt"]})
+                            queue.enqueue(args, url=url, name=url)
+                            queued += 1
+                        except Exception:
+                            pass
+                self.respond_json({"ok": True, "queued": queued})
                 return
 
             if self.path != "/start":
@@ -3169,8 +3427,18 @@ def make_handler(queue: DownloadQueue, csrf_token: str, monitor: ChannelMonitor,
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the local YouTube archiver web UI.")
-    parser.add_argument("--host", default="127.0.0.1", help="Host to bind. Default: 127.0.0.1")
-    parser.add_argument("--port", type=yt_archive.positive_int, default=DEFAULT_PORT, help=f"Port to bind. Default: {DEFAULT_PORT}")
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("HOST", "127.0.0.1"),
+        help="Host to bind. Default: 127.0.0.1 (or $HOST)",
+    )
+    default_port = DEFAULT_PORT
+    if os.environ.get("PORT"):
+        try:
+            default_port = int(os.environ["PORT"])
+        except ValueError:
+            pass
+    parser.add_argument("--port", type=yt_archive.positive_int, default=default_port, help=f"Port to bind. Default: {DEFAULT_PORT} (or $PORT)")
     return parser
 
 
@@ -3178,18 +3446,12 @@ def _trigger_download(url: str, channel: Channel, prefix: str = "Auto"):
     """Shared callback to trigger a download when a new video/playlist is detected."""
     queue = _get_queue()
     if queue:
-        args = argparse.Namespace(
+        args = default_archive_args(
             urls=[url],
             output_dir="archive",
             audio_format=channel.audio_format,
             audio_bitrate=channel.audio_bitrate,
-            audio_quality="0",
             download_archive="archive/downloaded.txt",
-            limit=None,
-            playlist_items=None,
-            no_sidecar_metadata=False,
-            dry_run=False,
-            yt_dlp="yt-dlp",
         )
         try:
             queue.enqueue(args, url=url, name=f"{prefix}: {channel.name}")
@@ -3236,8 +3498,17 @@ def main(argv: list[str] | None = None) -> int:
     tg_config = load_telegram_config()
     telegram_monitor = TelegramMonitor(tg_config)
     telegram_monitor.load_channels()
+    telegram_monitor.start_loop()
 
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(queue, secrets.token_urlsafe(32), monitor, webhook, telegram_monitor))
+    # DNS-rebinding defense: only accept requests addressed to this host:port
+    allowed_hosts = {f"{args.host}:{args.port}", args.host}
+    if args.host in {"0.0.0.0", "::", ""}:
+        allowed_hosts |= {
+            f"127.0.0.1:{args.port}", f"localhost:{args.port}", f"[::1]:{args.port}",
+            "127.0.0.1", "localhost", "[::1]",
+        }
+
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(queue, secrets.token_urlsafe(32), monitor, webhook, telegram_monitor, allowed_hosts=allowed_hosts))
     print(f"Open http://{args.host}:{args.port}")
     print(f"Channel monitor: {'running' if monitor.is_running else 'stopped'}")
     try:

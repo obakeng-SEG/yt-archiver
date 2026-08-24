@@ -13,7 +13,11 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Callable, Optional
 
+from utils import atomic_write_text
+
 LOG = logging.getLogger("monitor")
+
+DEFAULT_CHANNELS_FILE = "channels.json"
 
 
 @dataclass
@@ -48,10 +52,12 @@ class ChannelMonitor:
         config: MonitorConfig,
         on_new_video: Optional[Callable[[str, Channel], None]] = None,
         on_new_playlist: Optional[Callable[[str, Channel], None]] = None,
+        channels_path: str = DEFAULT_CHANNELS_FILE,
     ):
         self.config = config
         self.on_new_video = on_new_video
         self.on_new_playlist = on_new_playlist
+        self._channels_path = Path(channels_path)
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -406,16 +412,16 @@ class ChannelMonitor:
             "output_dir": self.config.output_dir,
             "download_archive": self.config.download_archive,
         }
-        path = Path("channels.json")
-        path.write_text(json.dumps(data, indent=2))
+        atomic_write_text(self._channels_path, json.dumps(data, indent=2))
 
     @classmethod
     def load(
         cls,
         on_new_video: Optional[Callable] = None,
         on_new_playlist: Optional[Callable] = None,
+        channels_path: str = DEFAULT_CHANNELS_FILE,
     ) -> "ChannelMonitor":
-        path = Path("channels.json")
+        path = Path(channels_path)
         if path.exists():
             try:
                 data = json.loads(path.read_text())
@@ -429,8 +435,8 @@ class ChannelMonitor:
                     download_archive=data.get("download_archive", "archive/downloaded.txt"),
                 )
             except Exception as e:
-                LOG.warning(f"Could not load channels.json: {e}")
+                LOG.warning(f"Could not load {channels_path}: {e}")
                 config = MonitorConfig()
         else:
             config = MonitorConfig()
-        return cls(config=config, on_new_video=on_new_video, on_new_playlist=on_new_playlist)
+        return cls(config=config, on_new_video=on_new_video, on_new_playlist=on_new_playlist, channels_path=channels_path)

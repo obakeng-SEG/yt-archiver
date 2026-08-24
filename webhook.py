@@ -4,13 +4,18 @@
 import json
 import logging
 import threading
+import urllib.parse
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
 
+from utils import atomic_write_text
+
 LOG = logging.getLogger("webhook")
+
+DEFAULT_WEBHOOKS_FILE = "webhooks.json"
 
 
 @dataclass
@@ -21,24 +26,40 @@ class WebhookConfig:
     name: str = ""
 
 
+def build_webhook_payload(url: str, event: str, data: dict) -> dict:
+    """Shape the payload for the target provider.
+
+    Discord requires a 'content' field and Slack requires 'text'; posting our
+    raw event dict to them returns HTTP 400. Unknown hosts get the raw payload.
+    """
+    host = urllib.parse.urlparse(url).netloc.lower()
+    summary = json.dumps(data)[:1500]
+    if "discord.com" in host or "discordapp.com" in host:
+        return {"content": f"**[{event}]** `{summary}`"}
+    if "hooks.slack.com" in host:
+        return {"text": f"[{event}] {summary}"}
+    return {"event": event, "data": data}
+
+
 class WebhookManager:
-    def __init__(self):
+    def __init__(self, webhooks_path: str = DEFAULT_WEBHOOKS_FILE):
         self._webhooks: list[WebhookConfig] = []
+        self._path = Path(webhooks_path)
         self._lock = threading.Lock()
         self._load()
 
     def _load(self):
-        path = Path("webhooks.json")
-        if path.exists():
+        if self._path.exists():
             try:
-                data = json.loads(path.read_text())
+                data = json.loads(self._path.read_text())
                 self._webhooks = [WebhookConfig(**w) for w in data.get("webhooks", [])]
             except Exception as e:
-                LOG.warning(f"Could not load webhooks.json: {e}")
+                LOG.warning(f"Could not load {self._path}: {e}")
 
     def _save(self):
-        Path("webhooks.json").write_text(
-            json.dumps({"webhooks": [asdict(w) for w in self._webhooks]}, indent=2)
+        atomic_write_text(
+            self._path,
+            json.dumps({"webhooks": [asdict(w) for w in self._webhooks]}, indent=2),
         )
 
     def add_webhook(self, url: str, name: str = "", events: Optional[list[str]] = None) -> WebhookConfig:
@@ -46,8 +67,11 @@ class WebhookManager:
             raise ValueError("URL is required")
         if events is None:
             events = ["download_complete", "download_failed", "new_playlist"]
-        webhook = WebhookConfig(url=url, name=name or url, events=events)
         with self._lock:
+            for existing in self._webhooks:
+                if existing.url == url:
+                    raise ValueError(f"Webhook already configured: {existing.name}")
+            webhook = WebhookConfig(url=url, name=name or url, events=events)
             self._webhooks.append(webhook)
             self._save()
         LOG.info(f"Added webhook: {webhook.name}")
@@ -81,10 +105,7 @@ class WebhookManager:
 
     def _send_webhook(self, webhook: WebhookConfig, event: str, data: dict):
         """Send a single webhook notification."""
-        payload = {
-            "event": event,
-            "data": data,
-        }
+        payload = build_webhook_payload(webhook.url, event, data)
         try:
             req = urllib.request.Request(
                 webhook.url,

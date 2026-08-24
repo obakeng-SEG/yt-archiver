@@ -116,35 +116,14 @@ On first run, you'll be prompted to enter your phone number and verification cod
 
 ### Step 4: Add Telegram Channels
 
-**Via Web UI:**
-1. Open the web UI
-2. Scroll to the "Telegram" card
-3. Enter channel URL (e.g., `@channelname` or `https://t.me/channelname`)
-4. Click "Add Channel"
-
-**Via CLI:**
-```bash
-python3 yt_archive.py --telegram-add "@channelname"
-```
+Open the web UI, scroll to the **Telegram** card, connect, then enter a channel URL
+(e.g., `@channelname` or `https://t.me/channelname`) and click **Add Channel**.
 
 ### Step 5: Download Audio
 
-**Via Web UI:**
-1. Browse channel audio files
-2. Select files to download
-3. Click "Download"
-
-**Via CLI:**
-```bash
-# List audio files
-python3 yt_archive.py --telegram-list "@channelname"
-
-# Download all audio
-python3 yt_archive.py --telegram-download "@channelname"
-
-# Download with limit
-python3 yt_archive.py --telegram-download "@channelname" --limit 10
-```
+1. In the Telegram card pick a channel from **Browse Channel**
+2. Click **Browse Audio**, select files
+3. Click **Download Selected**
 
 ## Audio Normalization
 
@@ -210,11 +189,11 @@ python3 yt_archive.py --normalize ebu --normalize-target -16 "URL"
 ### Environment Variables
 
 ```bash
-# Web UI port
+# Web UI port (also configurable via --port)
 PORT=8765
 
-# Default output directory
-OUTPUT_DIR=archive
+# Web UI bind address (also configurable via --host)
+HOST=127.0.0.1
 ```
 
 ### Configuration Files
@@ -225,6 +204,7 @@ OUTPUT_DIR=archive
 | `telegram_channels.json` | Monitored Telegram channels |
 | `channels.json` | Monitored YouTube channels |
 | `download_history.json` | Download history |
+| `queue_state.json` | Queue settings (quiet hours) |
 | `webhooks.json` | Webhook configurations |
 
 ## CLI Options
@@ -244,17 +224,16 @@ YouTube Options:
   --normalize-target VALUE    Target level (default: -16.0)
   --dry-run                   Print command without downloading
 
-Telegram Options:
-  --telegram-add CHANNEL      Add a Telegram channel to monitor
-  --telegram-remove CHANNEL   Remove a Telegram channel
-  --telegram-list CHANNEL     List audio files in a channel
-  --telegram-download CHANNEL Download audio from a channel
-  --telegram-monitor CHANNEL  Start monitoring a channel
-
-Web UI Options:
-  --host HOST                 Bind address. Default: 127.0.0.1
-  --port PORT                 Bind port. Default: 8765
+Web UI Options (python3 web_ui.py):
+  --host HOST                 Bind address. Default: 127.0.0.1 ($HOST)
+  --port PORT                 Bind port. Default: 8765 ($PORT)
 ```
+
+> **Note:** a `watch?v=…` URL that also contains a `list=…` parameter is treated as a
+> playlist and the whole playlist is downloaded. Remove the `list=` parameter if you
+> only want the single video.
+
+Telegram channels are managed through the Web UI (see *Telegram Setup* above).
 
 ## Output Structure
 

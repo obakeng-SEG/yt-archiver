@@ -33,6 +33,7 @@ telegram_config.json
 
 # Project state (may contain user data)
 download_history.json
+queue_state.json
 channels.json
 webhooks.json
 

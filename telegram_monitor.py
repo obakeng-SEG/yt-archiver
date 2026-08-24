@@ -11,10 +11,13 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Callable, Optional
+
+from utils import atomic_write_text
 
 LOG = logging.getLogger("telegram_monitor")
 
@@ -45,17 +48,47 @@ class TelegramMonitor:
         config: TelegramConfig,
         output_dir: str = "archive",
         on_new_audio: Optional[Callable[[str, TelegramChannel], None]] = None,
+        channels_path: str = CHANNELS_FILE,
     ):
         self.config = config
         self.output_dir = output_dir
         self.on_new_audio = on_new_audio
+        self._channels_path = Path(channels_path)
         self._client = None
         self._channels: list[TelegramChannel] = []
-        self._thread: Optional[asyncio.Thread] = None
-        self._stop_event = asyncio.Event()
-        self._lock = asyncio.Lock()
         self._log_callback: Optional[Callable[[str], None]] = None
         self._running = False
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop_thread: Optional[threading.Thread] = None
+        self._phone_code_hash: Optional[str] = None
+        self._phone: Optional[str] = None
+        self._stop_event: Optional[asyncio.Event] = None
+
+    def _ensure_stop_event(self) -> asyncio.Event:
+        """Lazily create the stop event on the monitor's event loop."""
+        if self._stop_event is None:
+            self._stop_event = asyncio.Event()
+        return self._stop_event
+
+    def request_stop(self):
+        """Signal any running channel monitor to stop (thread-safe)."""
+        if self._loop and self._stop_event:
+            self._loop.call_soon_threadsafe(self._stop_event.set)
+
+    def start_loop(self):
+        """Start a dedicated event loop in a background thread."""
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._loop_thread.start()
+
+    def _run_loop(self):
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def run_async(self, coro):
+        """Schedule a coroutine on the dedicated loop and wait for result."""
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=30)
 
     def set_log_callback(self, callback: Callable[[str], None]):
         self._log_callback = callback
@@ -65,22 +98,57 @@ class TelegramMonitor:
         if self._log_callback:
             self._log_callback(msg)
 
-    async def connect(self) -> bool:
-        """Connect to Telegram. Returns True if successful."""
+    async def connect(self, phone: str = None, code: str = None) -> dict:
+        """Multi-step connect to Telegram.
+
+        Args:
+            phone: Phone number (optional, triggers phone_code_hash request)
+            code: Verification code (optional, completes auth)
+
+        Returns:
+            Dict with 'status' key: 'awaiting_phone', 'awaiting_code', or 'connected'
+        """
         try:
             from telethon import TelegramClient
 
-            self._client = TelegramClient(
-                self.config.session_name,
-                self.config.api_id,
-                self.config.api_hash,
-            )
-            await self._client.start()
-            self._log("Connected to Telegram")
-            return True
+            if self._client and self._client.is_connected():
+                if await self._client.is_user_authorized():
+                    me = await self._client.get_me()
+                    self._log(f"Already connected as {me.first_name}")
+                    return {"status": "connected", "name": me.first_name}
+
+            if not self._client:
+                self._client = TelegramClient(
+                    self.config.session_name,
+                    self.config.api_id,
+                    self.config.api_hash,
+                )
+                await self._client.connect()
+
+            if not await self._client.is_user_authorized():
+                if not phone:
+                    return {"status": "awaiting_phone"}
+
+                if phone and not code:
+                    sent_code = await self._client.send_code_request(phone)
+                    self._phone_code_hash = sent_code.phone_code_hash
+                    self._phone = phone
+                    return {"status": "awaiting_code"}
+
+                if phone and code:
+                    await self._client.sign_in(phone, code, phone_code_hash=self._phone_code_hash)
+                    me = await self._client.get_me()
+                    self._log(f"Connected to Telegram as {me.first_name}")
+                    return {"status": "connected", "name": me.first_name}
+
+            me = await self._client.get_me()
+            self._log(f"Connected to Telegram as {me.first_name}")
+            return {"status": "connected", "name": me.first_name}
+
         except Exception as e:
             self._log(f"Failed to connect to Telegram: {e}")
-            return False
+            self._client = None
+            return {"status": "error", "error": str(e)}
 
     async def disconnect(self):
         """Disconnect from Telegram."""
@@ -281,8 +349,9 @@ class TelegramMonitor:
 
         # Load seen IDs
         seen_ids = set(self._load_seen_ids(channel))
+        stop_event = self._ensure_stop_event()
 
-        while not self._stop_event.is_set():
+        while not stop_event.is_set():
             try:
                 async for message in self._client.iter_messages(entity, limit=20):
                     if message.id in seen_ids:
@@ -309,7 +378,7 @@ class TelegramMonitor:
 
             # Wait for next check
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=check_interval)
+                await asyncio.wait_for(stop_event.wait(), timeout=check_interval)
                 break  # Stop was requested
             except asyncio.TimeoutError:
                 pass  # Continue monitoring
@@ -329,17 +398,15 @@ class TelegramMonitor:
         """Save seen message IDs to file."""
         try:
             path = Path(self.output_dir) / f".telegram_seen_{channel}.json"
-            with open(path, "w") as f:
-                json.dump(ids, f)
+            atomic_write_text(path, json.dumps(ids))
         except Exception as e:
             self._log(f"Failed to save seen IDs: {e}")
 
     def load_channels(self) -> list[TelegramChannel]:
         """Load channels from config file."""
         try:
-            path = Path(CHANNELS_FILE)
-            if path.exists():
-                with open(path) as f:
+            if self._channels_path.exists():
+                with open(self._channels_path) as f:
                     data = json.load(f)
                 self._channels = [TelegramChannel(**ch) for ch in data]
         except Exception as e:
@@ -349,14 +416,18 @@ class TelegramMonitor:
     def save_channels(self):
         """Save channels to config file."""
         try:
-            path = Path(CHANNELS_FILE)
-            with open(path, "w") as f:
-                json.dump([asdict(ch) for ch in self._channels], f, indent=2)
+            atomic_write_text(self._channels_path, json.dumps([asdict(ch) for ch in self._channels], indent=2))
         except Exception as e:
             LOG.error(f"Failed to save channels: {e}")
 
     def add_channel(self, channel_id: int, name: str, username: str = "") -> TelegramChannel:
-        """Add a channel to monitor."""
+        """Add a channel to monitor. Updates in place if the ID already exists."""
+        for ch in self._channels:
+            if ch.channel_id == channel_id:
+                ch.name = name
+                ch.username = username
+                self.save_channels()
+                return ch
         ch = TelegramChannel(channel_id=channel_id, name=name, username=username)
         self._channels.append(ch)
         self.save_channels()
@@ -392,8 +463,6 @@ def load_telegram_config() -> TelegramConfig:
 def save_telegram_config(config: TelegramConfig):
     """Save Telegram configuration to file."""
     try:
-        path = Path(CONFIG_FILE)
-        with open(path, "w") as f:
-            json.dump(asdict(config), f, indent=2)
+        atomic_write_text(CONFIG_FILE, json.dumps(asdict(config), indent=2))
     except Exception as e:
         LOG.error(f"Failed to save Telegram config: {e}")
